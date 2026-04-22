@@ -1,0 +1,16 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build_cuda",
+            "type": "shell",
+            "command":"nvcc",
+            "args": ["-g", "-G", "-o", "${workspaceFolder}/debugger/${fileBasenameNoExtension}", "${file}"],
+            "problemMatcher": ["$nvcc"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        }
+    ]
+}

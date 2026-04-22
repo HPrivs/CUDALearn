@@ -1,0 +1,13 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "cuda_launch",
+            "type": "cuda-gdb",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/debugger/${fileBasenameNoExtension}",
+            "preLaunchTask": "build_cuda"
+        }
+    ]
+}
