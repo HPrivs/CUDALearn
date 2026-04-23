@@ -8,6 +8,7 @@
 
 ### Elementwise / VecAdd（入门首选）
 1. naive：一个线程处理一个元素
+2. `float4` 向量化访存：一个线程处理 4 个连续元素，减少访存指令条数
 
 **瓶颈演进**：始终 memory-bound，目标逼近 DRAM 带宽峰值
 

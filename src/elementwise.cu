@@ -5,6 +5,9 @@
 
 #include "common.cuh"
 
+#include <cuda_runtime.h>
+
+#include <array>
 #include <iostream>
 #include <vector>
 
@@ -34,6 +37,38 @@ void launch_naive(const float* a, const float* b, float* c, int n) {
     kernel_naive<<<grid, kBlockSize>>>(a, b, c, n);
 }
 
+// ========= v2: float4 vectorized load/store =========
+// 为什么这么做：一次让一个线程处理 4 个连续 float，可减少访存指令条数。
+__global__ void kernel_v2_float4(const float4* a,
+                                 const float4* b,
+                                 float4* c,
+                                 int vec_n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < vec_n) {
+        float4 av = a[idx];
+        float4 bv = b[idx];
+        c[idx] = make_float4(av.x + bv.x, av.y + bv.y, av.z + bv.z, av.w + bv.w);
+    }
+}
+
+void launch_v2_float4(const float* a, const float* b, float* c, int n) {
+    int vec_n = n / 4;
+    if (vec_n > 0) {
+        int grid = (vec_n + kBlockSize - 1) / kBlockSize;
+        kernel_v2_float4<<<grid, kBlockSize>>>(
+            reinterpret_cast<const float4*>(a),
+            reinterpret_cast<const float4*>(b),
+            reinterpret_cast<float4*>(c),
+            vec_n);
+    }
+
+    int tail = n - vec_n * 4;
+    if (tail > 0) {
+        kernel_naive<<<1, tail>>>(a + vec_n * 4, b + vec_n * 4, c + vec_n * 4, tail);
+    }
+}
+
+
 }  // namespace
 
 int main() {
@@ -57,17 +92,17 @@ int main() {
 
     std::cout << "version            ms        GB/s     TFLOPS     max_err\n";
 
-    launch_naive(d_a, d_b, d_c, n);
+    launch_v2_float4(d_a, d_b, d_c, n);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
     CUDA_CHECK(cudaMemcpy(h_out.data(), d_c, bytes, cudaMemcpyDeviceToHost));
     float err = max_abs_err(h_out.data(), h_ref.data(), h_out.size());
 
-    float ms = timeit([&] { launch_naive(d_a, d_b, d_c, n); });
+    float ms = timeit([&] {launch_v2_float4(d_a, d_b, d_c, n); });
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
-    print_row("naive", ms, traffic_bytes, flops, err);
+    print_row("float4", ms, traffic_bytes, flops, err);
 
     CUDA_CHECK(cudaFree(d_a));
     CUDA_CHECK(cudaFree(d_b));
