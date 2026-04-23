@@ -14,11 +14,8 @@
 
 ### Reduce / Sum（入门第二步）
 1. naive：atomicAdd 到全局变量（正确但极慢）
-2. SMEM 树形归约：block 内 shared memory 折半相加
-3. warp shuffle：`__shfl_xor_sync` / `__shfl_down_sync` 免 SMEM
-4. 两阶段归约：block 内归约 → grid 再归约一次，避免 atomic
 
-**瓶颈演进**：memory-bound → latency-bound（同步开销主导）
+**当前瓶颈**：latency-bound / atomic contention-bound，所有线程竞争同一个全局输出地址
 
 ---
 

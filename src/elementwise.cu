@@ -14,7 +14,7 @@
 namespace {
 
 constexpr int kBlockSize = 256;
-constexpr int kNumElems = 1 << 24;
+constexpr int kNumElems = (1 << 24);
 
 void cpu_ref(const std::vector<float>& a,
              const std::vector<float>& b,
@@ -30,6 +30,7 @@ __global__ void kernel_naive(const float* a, const float* b, float* c, int n) {
     if (idx < n) {
         c[idx] = a[idx] + b[idx];
     }
+
 }
 
 void launch_naive(const float* a, const float* b, float* c, int n) {
