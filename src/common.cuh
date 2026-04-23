@@ -20,6 +20,7 @@
         }                                                                      \
     } while (0)
 
+
 template <typename Launcher>
 float timeit(Launcher&& launcher, int warmup = 10, int iters = 100) {
     for (int i = 0; i < warmup; ++i) {

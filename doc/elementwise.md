@@ -30,7 +30,7 @@
 先用下面命令在你的机器上测：
 
 ```bash
-nvcc -O3 -std=c++17 src/elementwise.cu -o elementwise && ./elementwise
+nvcc src/elementwise.cu -o elementwise && ./elementwise
 ```
 
 把输出表里的 `ms / GB/s / max_err` 记下来，后面 v2、v3 都要和它比。
