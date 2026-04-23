@@ -23,6 +23,7 @@ void cpu_ref(const std::vector<float>& x, std::vector<float>& y) {
     y[0] = static_cast<float>(sum);
 }
 
+
 // ========= v1: naive atomicAdd =========
 // 为什么这么做：先用最直接的全局 atomicAdd 保证正确性，后面再逐步减少原子操作和同步开销。
 __global__ void kernel_naive(const float* x, float* y, int n) {
@@ -46,6 +47,7 @@ int main() {
     const size_t output_bytes = sizeof(float);
     const size_t traffic_bytes = input_bytes + output_bytes;
     const size_t flops = static_cast<size_t>(n - 1);
+
 
     float* d_x = nullptr;
     float* d_y = nullptr;
