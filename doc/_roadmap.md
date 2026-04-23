@@ -14,8 +14,9 @@
 
 ### Reduce / Sum（入门第二步）
 1. naive：atomicAdd 到全局变量（正确但极慢）
+2. shared memory block reduce：每个 block 先做局部归约，再执行一次全局 atomicAdd
 
-**当前瓶颈**：latency-bound / atomic contention-bound，所有线程竞争同一个全局输出地址
+**当前瓶颈**：block 内同步开销 + shared memory 归约开销 + 剩余全局 atomic contention
 
 ---
 

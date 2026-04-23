@@ -39,6 +39,34 @@ void launch_naive(const float* x, float* y, int n) {
     kernel_naive<<<grid, kBlockSize>>>(x, y, n);
 }
 
+// ========= v2: shared memory block reduce =========
+// shared memory 是 block 内线程共享的片上存储；先在 block 内求局部和，可以把全局 atomicAdd 次数大幅减少。
+__global__ void kernel_v2(const float* x, float* y, int n) {
+    __shared__ float smem[kBlockSize];
+
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+    smem[tid] = (idx < n) ? x[idx] : 0.0f;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicAdd(y, smem[0]);
+    }
+}
+
+void launch_v2(const float* x, float* y, int n) {
+    CUDA_CHECK(cudaMemset(y, 0, sizeof(float)));
+    int grid = (n + kBlockSize - 1) / kBlockSize;
+    kernel_v2<<<grid, kBlockSize>>>(x, y, n);
+}
+
 }  // namespace
 
 int main() {
@@ -73,6 +101,18 @@ int main() {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     print_row("naive", ms, traffic_bytes, flops, err);
+
+    launch_v2(d_x, d_y, n);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_y, output_bytes, cudaMemcpyDeviceToHost));
+    err = max_abs_err(h_out.data(), h_ref.data(), h_out.size());
+
+    ms = timeit([&] { launch_v2(d_x, d_y, n); }, 10, 100);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    print_row("v2_smem", ms, traffic_bytes, flops, err);
 
     CUDA_CHECK(cudaFree(d_x));
     CUDA_CHECK(cudaFree(d_y));
