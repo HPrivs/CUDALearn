@@ -15,6 +15,7 @@
 namespace {
 
 constexpr int kBlockSize = 256;
+constexpr int kItemsPerThread = 4;
 constexpr int kNumElems = (1 << 22);
 
 void cpu_ref(const std::vector<float>& x, std::vector<float>& y) {
@@ -73,6 +74,45 @@ void launch_v2(const float* x, float* y, int n) {
     kernel_v2<<<grid, kBlockSize>>>(x, y, n);
 }
 
+// ========= v3: per-thread accumulation =========
+// 每个线程先在寄存器里累加多个连续批次的元素，再进入 shared memory 归约；
+// 这样可以减少 block 数和最终全局 atomicAdd 次数。
+__global__ void kernel_v3(const float* x, float* y, int n) {
+    __shared__ float smem[kBlockSize];
+
+    int tid = threadIdx.x;
+    int block_start = blockIdx.x * blockDim.x * kItemsPerThread;
+    float sum = 0.0f;
+
+    for (int i = 0; i < kItemsPerThread; ++i) {
+        int idx = block_start + i * blockDim.x + tid;
+        if (idx < n) {
+            sum += x[idx];
+        }
+    }
+
+    smem[tid] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicAdd(y, smem[0]);
+    }
+}
+
+void launch_v3(const float* x, float* y, int n) {
+    CUDA_CHECK(cudaMemset(y, 0, sizeof(float)));
+    int elems_per_block = kBlockSize * kItemsPerThread;
+    int grid = (n + elems_per_block - 1) / elems_per_block;
+    kernel_v3<<<grid, kBlockSize>>>(x, y, n);
+}
+
 }  // namespace
 
 int main() {
@@ -119,6 +159,18 @@ int main() {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     print_row("v2_smem", ms, traffic_bytes, flops, err);
+
+    launch_v3(d_x, d_y, n);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_y, output_bytes, cudaMemcpyDeviceToHost));
+    err = max_abs_err(h_out.data(), h_ref.data(), h_out.size());
+
+    ms = timeit([&] { launch_v3(d_x, d_y, n); }, 10, 100);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    print_row("v3_items4", ms, traffic_bytes, flops, err);
 
     CUDA_CHECK(cudaFree(d_x));
     CUDA_CHECK(cudaFree(d_y));

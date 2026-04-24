@@ -196,7 +196,7 @@ root/
 ## `common.cuh` 应提供
 
 - `CUDA_CHECK(expr)`。
-- `float timeit(launcher_lambda, int warmup=10, int iters=100)`。
+- `float timeit(launcher_lambda, int warmup=10, int iters=20)`。
 - `random_fill<T>(T* d_ptr, size_t n, unsigned seed)`。
 - `max_abs_err<T>(const T* a, const T* b, size_t n)`：失败时打印首个坏下标。
 - `print_row(const char* version, float ms, size_t bytes, size_t flops, float err)`：打印 `ms / 有效 GB/s / TFLOPS / max_err`。
@@ -222,6 +222,7 @@ root/
 - 后续版本只追加 `## vN 作业`，不得覆盖用户答案。
 - 每道题预留「我的答案」「自我检查」「批改反馈」三个位置。
 - 用户请求批改作业时，默认把该文件视为主要批改对象。
+- 批改完成后，需要给出相应批改反馈。
 
 按阶段选题：
 

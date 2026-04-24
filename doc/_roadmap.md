@@ -11,8 +11,9 @@
 ### Reduce / Sum（入门第二步）
 1. naive：atomicAdd 到全局变量（正确但极慢）
 2. shared memory block reduce：每个 block 先做局部归约，再执行一次全局 atomicAdd
+3. per-thread accumulation：每个线程先在 register 中累加多个元素，再进入 shared memory 归约
 
-**当前瓶颈**：block 内同步开销 + shared memory 归约开销 + 剩余全局 atomic contention
+**当前瓶颈**：输入读取 + block 内同步开销 + shared memory 归约开销 + 剩余全局 atomic contention
 
 ---
 

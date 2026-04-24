@@ -10,6 +10,7 @@
 - reduce：把多个输入元素合并成更少输出元素的操作。
 - `atomicAdd`：多个线程更新同一个地址时，硬件保证每次读-改-写不会互相覆盖。
 - shared memory：同一个 block 内线程共享的片上存储。
+- register：每个线程私有的最快片上存储，适合保存该线程自己的临时累加值。
 
 ## 问题规格
 - 输入：长度为 `N` 的 1D 向量 `X`
@@ -132,13 +133,6 @@ v2 的核心收益不体现在 `AI`，而体现在全局原子次数：
 shared memory 访问和 `__syncthreads()` 的行级影响，优先在 Nsight Compute 的 Source 页面按代码行看耗时。不要只看 `AI`，因为 v2 的优化目标不是提高 `AI`，而是减少全局合并冲突。
 
 ### 实测结果
-当前环境中曾出现运行失败：
-
-```text
-CUDA driver version is insufficient for CUDA runtime version
-```
-
-因此 v2 需要在 CUDA driver 与 runtime 匹配的机器上复测：
 
 ```bash
 nvcc src/reduce.cu -o debugger/reduce && ./debugger/reduce
@@ -148,7 +142,7 @@ nvcc src/reduce.cu -o debugger/reduce && ./debugger/reduce
 
 | version | ms | GB/s | TFLOPS | max_err |
 | --- | ---: | ---: | ---: | ---: |
-| v2_smem | 待实测 | 待实测 | 待实测 | 待实测 |
+| v2_smem | 1.6545 | 10.14 | 0.0025 | 0.000000 |
 
 预期现象：`v2_smem` 应明显快于 `naive`。如果没有明显变快，按下面顺序检查：
 
@@ -176,12 +170,99 @@ v2 已经解决最粗糙的全局原子风暴，但仍有三个限制：
 ### 下一步
 下一版可以让每个线程先读取并累加多个元素，再进入 shared memory 归约。这样做会减少 block 数、减少最后的全局 `atomicAdd` 次数，并提高每个线程在同步前完成的有效工作量。
 
+## v3 — per-thread accumulation
+
+### 本版学习目标
+让每个线程先在 register 中累加 4 个元素，再把局部和写入 shared memory 做 block 内归约。
+
+register 是每个线程私有的最快片上存储。这里用它保存该线程的临时 `sum`，避免每读一个元素都立刻进入 block 级合并。
+
+### 改动
+v2 中每个线程只读 1 个元素，每个 block 处理 `blockDim.x` 个元素。v3 中每个线程读最多 `kItemsPerThread = 4` 个元素，并在自己的 `sum` 变量里先累加，因此每个 block 处理 `blockDim.x * 4` 个元素。
+
+读取方式是：
+
+```cpp
+idx = block_start + i * blockDim.x + tid
+```
+
+对固定的 `i`，相邻线程仍然读取相邻地址，所以每一轮读都是 coalesced access。
+
+### 为什么可能更快
+v3 的收益来自两个地方：
+
+1. block 数减少为 v2 的约 `1 / 4`。
+2. 最终全局 `atomicAdd` 次数也减少为 v2 的约 `1 / 4`。
+
+默认 `N = 1 << 22`、`blockDim.x = 256`、`kItemsPerThread = 4` 时：
+
+| version | 每 block 处理元素 | 全局 `atomicAdd` 次数 |
+| --- | ---: | ---: |
+| v2_smem | 256 | 16,384 |
+| v3_items4 | 1,024 | 4,096 |
+
+这版没有减少读取 `x` 的 DRAM 字节数，也没有改变求和的总 FLOPs。它减少的是 block 级归约和跨 block 合并的次数。
+
+### 代码要点
+- `sum` 是线程私有 register 变量，先累加最多 4 个输入元素。
+- 每个线程只把一个局部和写入 `smem[tid]`。
+- shared memory 树形归约逻辑和 v2 相同。
+- 尾部元素用 `idx < n` 保护，所以不要求 `N` 能被 `blockDim.x * kItemsPerThread` 整除。
+
+### 定量分析
+设 `T = blockDim.x`，`K = kItemsPerThread`。
+
+| 量 | 表达式 | 说明 |
+| --- | --- | --- |
+| 访存字节 `B` | `N * 4 + 4` | 仍然读 `N` 个输入，最终得到 1 个输出 |
+| FLOPs `F` | `N - 1` | 总求和次数不变 |
+| 算术强度 `AI` | `F / B ≈ 0.25 FLOP/Byte` | 与 v2 基本相同 |
+
+全局 `atomicAdd` 次数从 `ceil(N / T)` 降为 `ceil(N / (T * K))`。默认配置下是从 `16,384` 次降到 `4,096` 次。
+
+瓶颈定性判定：**memory-bound + 剩余 block 归约开销 + 剩余全局 atomic contention**。如果 `K` 过大，单线程串行累加太多元素、寄存器压力增加，可能让 occupancy 或并行度下降。
+
+可验证的 NCU metric：
+- `dram__bytes.sum`
+- `dram__throughput.avg.pct_of_peak_sustained_elapsed`
+- `sm__throughput.avg.pct_of_peak_sustained_elapsed`
+- `smsp__inst_executed.sum`
+- `smsp__sass_thread_inst_executed_op_fadd_pred_on.sum`
+
+如果要验证这版是否减少了全局合并开销，优先比较 Source 页面中最后 `atomicAdd` 所在行的耗时占比，再结合总 kernel 时间判断。
+
+### 实测结果
+当前环境仍需要在 CUDA driver 与 runtime 匹配的机器上复测：
+
+```bash
+nvcc src/reduce.cu -o debugger/reduce && ./debugger/reduce
+```
+
+待补记录：
+
+| version | ms | GB/s | TFLOPS | max_err |
+| --- | ---: | ---: | ---: | ---: |
+| v3_items4 | 0.6080 | 27.60 | 0.0069 | 0.000122 |
+
+预期现象：`v3_items4` 通常应快于 `v2_smem`，但提升幅度未必接近 4 倍，因为 shared memory 归约、同步、输入读取和 kernel 调度仍然存在。
+
+
+### 瓶颈
+v3 进一步减少了全局 `atomicAdd` 和 block 数，但 block 内仍然使用 shared memory 树形归约，每轮仍有 `__syncthreads()`。当数据规模很大时，输入 DRAM 读取会逐渐成为更主要的限制。
+
+### 代价或限制
+`kItemsPerThread` 不是越大越好。它变大后，单线程串行工作增加，寄存器使用可能增加，block 数也会减少；如果 block 数过少，GPU 可能吃不满。
+
+### 下一步
+下一版可以引入 warp-level reduction，用 warp 内部的 `__shfl_down_sync` 减少 shared memory 访问和部分 `__syncthreads()`。
+
 ## 对比总表
 
 | version | 核心方法 | 全局 atomic 次数 | 主要瓶颈 | 当前状态 |
 | --- | --- | ---: | --- | --- |
 | naive | 每个线程直接 `atomicAdd(y, x[idx])` | `N` | 同地址全局原子竞争 | 已测：`8.3756 ms`，`2.00 GB/s` |
 | v2_smem | block 内 shared memory 树形归约，每个 block 一次全局 `atomicAdd` | `ceil(N / blockDim.x)` | block 内同步 + 剩余全局原子竞争 | 待在匹配 CUDA 环境复测 |
+| v3_items4 | 每线程 register 预累加 4 个元素，再做 block reduce | `ceil(N / (blockDim.x * 4))` | 输入读取 + block 内同步 + 剩余全局原子竞争 | 待在匹配 CUDA 环境复测 |
 
 ## 作业
 本算子的作业在 `homework/reduce.md`。
@@ -201,6 +282,10 @@ for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
     }
 }
 ```
+
+### v3 作业
+1. 用一句话解释：为什么 `kItemsPerThread = 4` 可以减少全局 `atomicAdd` 次数，但不改变 reduce 的 `AI`？
+2. 预测题：如果把 `kItemsPerThread` 从 4 改成 16，性能一定会继续变好吗？请从 block 数、单线程串行工作、寄存器压力三个角度回答。
 
 ## 参考资料
 - CUDA C++ Programming Guide: Atomic Functions
