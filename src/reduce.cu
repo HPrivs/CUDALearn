@@ -111,6 +111,7 @@ void launch_v3(const float* x, float* y, int n) {
     int elems_per_block = kBlockSize * kItemsPerThread;
     int grid = (n + elems_per_block - 1) / elems_per_block;
     kernel_v3<<<grid, kBlockSize>>>(x, y, n);
+
 }
 
 }  // namespace
