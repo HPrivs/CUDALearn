@@ -1,5 +1,16 @@
 # ElementWise
 
+## 学习目标
+- 写出最小正确的 elementwise add CUDA kernel。
+- 用 `timeit` 和统一表格比较不同版本。
+- 用访存字节、FLOPs 和 `AI` 判断瓶颈。
+- 理解 `float4` 向量化访存只减少访存指令组织开销，不改变总访存字节。
+
+## 前置知识
+- 一个 CUDA thread 可以负责一个或多个输出元素。
+- `blockIdx.x * blockDim.x + threadIdx.x` 是 1D kernel 中常用的全局线程下标。
+- memory-bound：主要时间受数据搬运限制，而不是受算术计算吞吐限制。
+
 ## 问题规格
 - 输入：两个长度为 `N` 的 1D 向量 `A`、`B`
 - 输出：一个长度为 `N` 的 1D 向量 `C`
@@ -8,8 +19,14 @@
 - 默认规模：`N = 1 << 24`
 
 ## v1 — naive
+### 本版学习目标
+建立 correctness 和 benchmark 基线：一个线程处理一个元素。
+
 ### 改动
 首版只做最直接的映射：一个线程处理一个元素，做一次加法后写回全局内存。
+
+### 为什么可能更快
+这是首版基线，不追求比已有版本更快；它的价值是最小正确实现和后续对照。
 
 ### 代码要点
 - `idx = blockIdx.x * blockDim.x + threadIdx.x`
@@ -27,31 +44,35 @@
   - `smsp__sass_thread_inst_executed_op_fadd_pred_on.sum`
 
 ### 实测结果
-先用下面命令在你的机器上测：
+历史记录：
 
-```bash
-nvcc src/elementwise.cu -o elementwise && ./elementwise
-```
-
-把输出表里的 `ms / GB/s / max_err` 记下来，后面 v2、v3 都要和它比。
+| version | ms | GB/s | TFLOPS | max_err |
+| --- | ---: | ---: | ---: | ---: |
+| naive | 4.1703 | 48.28 | 0.0040 | 0 |
 
 ### 瓶颈
 这个版本的瓶颈不是计算，而是 HBM / DRAM 带宽。每个元素只做 1 次加法，却要读 2 个 `float`、写 1 个 `float`。
+
+### 代价或限制
+每个线程只做很少工作，访存指令、地址计算和 launch 后的调度开销占比偏高。
 
 ### 下一步
 下一版最自然的方向是 **向量化访存**：让每个线程一次搬 16B，例如 `float4`，减少指令条数并改善访存效率。
 
 ## v2 — `float4` 向量化访存
+### 本版学习目标
+理解向量化访存优化的收益来源：减少指令数量，而不是减少有效访存字节。
+
 ### 改动
 这一版不再让一个线程只处理 1 个 `float`，而是让一个线程一次处理 4 个连续元素。具体做法是把 `float*` 按 `float4*` 解释，然后每个线程完成一次 `float4` 的 load、4 次加法、一次 `float4` 的 store。
 
 这版没有改变总访存字节数，也没有改变总 FLOPs；它优化的是**访存指令组织方式**，不是算法本身。
 
 ### 代码要点
-- 新增 `kernel_v2_float4(...)`，输入输出类型改为 `const float4* / float4*`
+- 新增 `kernel_v2(...)`，输入输出类型改为 `const float4* / float4*`
 - 线程索引 `idx` 现在对应的是“第几个 `float4`”，不是“第几个标量元素”
 - kernel 内先读 `av = a[idx]`、`bv = b[idx]`，再构造一个新的 `float4` 写回
-- `launch_v2_float4(...)` 先处理 `n / 4` 个完整向量，再用 `kernel_naive` 处理尾部 `n % 4` 个元素
+- `launch_v2(...)` 先处理 `n / 4` 个完整向量，再用 `kernel_naive` 处理尾部 `n % 4` 个元素
 
 这里单独保留尾部标量路径，是因为真实代码不能默认 `N` 永远是 4 的倍数。这样写以后，这个版本既能跑默认规模，也能跑一般规模。
 
@@ -104,11 +125,16 @@ nvcc src/elementwise.cu -o debugger/elementwise && ./debugger/elementwise
 | v2_float4 | 4.1346 | 48.68 | 0.0041 | 一个线程处理 4 个连续元素，减少访存指令条数 |
 
 ## 作业
-本算子的作业已迁移到 `homework/elementwise.md`。
+本算子的答题纸在 `homework/elementwise.md`。
 
-你可以在该文件里直接写：
-- 代码块
-- 概念题回答
-- 自己的分析过程
+### v1 作业
+1. 合上代码，自己默写 `kernel_naive` 的核心三行：算 `idx`、做边界检查、完成 `c[idx] = a[idx] + b[idx]`。
+2. 解释为什么这个算子的 `AI = 1/12` 很低，并用一句话判断它更像 memory-bound 还是 compute-bound。
 
-批改时如果你说「批改 elementwise 作业」，默认读取 `homework/elementwise.md`。
+### v2 作业
+1. 用一段话回答：为什么 `float4` 版的 `B`、`F`、`AI` 都没变，但它仍然可能比 naive 更快？
+2. 改错题：指出“直接把任意 `float*` 强转成 `float4*` 使用，但不检查尾部元素”和“看到 `float4` 后就断言这个 kernel 一定从 memory-bound 变成 compute-bound”分别错在哪里。
+
+## 参考资料
+- CUDA C++ Programming Guide: Vector Types
+- Nsight Compute: Memory Workload Analysis / Source Counters

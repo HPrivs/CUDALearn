@@ -2,6 +2,8 @@
 // I/O shape: x is a 1D vector with N elements, y is one scalar
 // dtype: float32
 // default problem size: N = 1 << 22
+// theoretical traffic per element: read x[i] 4B, plus one final output float
+// theoretical FLOPs per element: approximately 1 floating-point add
 
 #include "common.cuh"
 

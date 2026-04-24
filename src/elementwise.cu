@@ -2,6 +2,8 @@
 // I/O shape: A, B, C are 1D vectors with N elements
 // dtype: float32
 // default problem size: N = 1 << 24
+// theoretical traffic per element: read A[i] 4B + read B[i] 4B + write C[i] 4B = 12B
+// theoretical FLOPs per element: 1 floating-point add
 
 #include "common.cuh"
 
@@ -40,10 +42,10 @@ void launch_naive(const float* a, const float* b, float* c, int n) {
 
 // ========= v2: float4 vectorized load/store =========
 // 为什么这么做：一次让一个线程处理 4 个连续 float，可减少访存指令条数。
-__global__ void kernel_v2_float4(const float4* a,
-                                 const float4* b,
-                                 float4* c,
-                                 int vec_n) {
+__global__ void kernel_v2(const float4* a,
+                          const float4* b,
+                          float4* c,
+                          int vec_n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < vec_n) {
         float4 av = a[idx];
@@ -52,11 +54,11 @@ __global__ void kernel_v2_float4(const float4* a,
     }
 }
 
-void launch_v2_float4(const float* a, const float* b, float* c, int n) {
+void launch_v2(const float* a, const float* b, float* c, int n) {
     int vec_n = n / 4;
     if (vec_n > 0) {
         int grid = (vec_n + kBlockSize - 1) / kBlockSize;
-        kernel_v2_float4<<<grid, kBlockSize>>>(
+        kernel_v2<<<grid, kBlockSize>>>(
             reinterpret_cast<const float4*>(a),
             reinterpret_cast<const float4*>(b),
             reinterpret_cast<float4*>(c),
@@ -93,17 +95,29 @@ int main() {
 
     std::cout << "version            ms        GB/s     TFLOPS     max_err\n";
 
-    launch_v2_float4(d_a, d_b, d_c, n);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    struct Version {
+        const char* name;
+        void (*launch)(const float*, const float*, float*, int);
+    };
 
-    CUDA_CHECK(cudaMemcpy(h_out.data(), d_c, bytes, cudaMemcpyDeviceToHost));
-    float err = max_abs_err(h_out.data(), h_ref.data(), h_out.size());
+    const std::array<Version, 2> versions{{
+        {"naive", launch_naive},
+        {"v2_float4", launch_v2},
+    }};
 
-    float ms = timeit([&] {launch_v2_float4(d_a, d_b, d_c, n); });
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-    print_row("float4", ms, traffic_bytes, flops, err);
+    for (const auto& version : versions) {
+        version.launch(d_a, d_b, d_c, n);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        CUDA_CHECK(cudaMemcpy(h_out.data(), d_c, bytes, cudaMemcpyDeviceToHost));
+        float err = max_abs_err(h_out.data(), h_ref.data(), h_out.size());
+
+        float ms = timeit([&] { version.launch(d_a, d_b, d_c, n); });
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        print_row(version.name, ms, traffic_bytes, flops, err);
+    }
 
     CUDA_CHECK(cudaFree(d_a));
     CUDA_CHECK(cudaFree(d_b));
