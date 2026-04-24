@@ -42,13 +42,17 @@ void launch_naive(const float* x, float* y, int n) {
 // ========= v2: shared memory block reduce =========
 // shared memory 是 block 内线程共享的片上存储；先在 block 内求局部和，可以把全局 atomicAdd 次数大幅减少。
 __global__ void kernel_v2(const float* x, float* y, int n) {
+
+    // block内线程共享，线程块大小
     __shared__ float smem[kBlockSize];
 
     int tid = threadIdx.x;
     int idx = blockIdx.x * blockDim.x + tid;
     smem[tid] = (idx < n) ? x[idx] : 0.0f;
+
     __syncthreads();
 
+    // stride初始值为线程块的一半，每次减半(stride右移一位)
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             smem[tid] += smem[tid + stride];
