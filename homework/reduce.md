@@ -30,6 +30,12 @@ void launch_naive(const float* x, float* y, int n) {
 
 ### 批改反馈
 
+基本正确。你抓住了 v4 的核心：用 two-pass reduction 把 v3 中多个 block 对同一个 `y` 地址的全局 `atomicAdd`，改成第一轮写不同的 `partial[blockIdx.x]`，第二轮再归约 `partial`。
+
+需要补一处更严谨的定量说法：v4 的 `AI` 没有明显提高，甚至按有效 DRAM 访存口径会略低一点，因为它额外写 `P` 个 partial、再读 `P` 个 partial，其中 `P = ceil(N / (blockDim.x * kItemsPerThread))`。默认 `N = 1 << 22`、`blockDim.x = 256`、`kItemsPerThread = 16` 时，`P = 1024`，额外 partial 读写只有约 `8 KB`，相对输入约 `16 MB` 很小。
+
+标准答案可以压缩成一句：v4 没有减少输入读取和总加法次数，`AI` 基本不变，但它用一次额外 kernel launch 和很小的 partial 读写，换掉了 v3 剩余的同地址全局 `atomicAdd` 竞争，所以在默认大规模输入下可能更快。
+
 ### 题目 2
 用一段话解释：为什么 reduce naive 版的 `AI` 比 vector add 高一点，但实际可能比 vector add 慢很多？
 
@@ -38,6 +44,16 @@ void launch_naive(const float* x, float* y, int n) {
 reduce naive内核执行过程写入一次y，读取1次x[idx]，执行1次原子加法操作。访存量B为4N+4，操作量F为N - 1，AI=1/4 = 0.25,比vectorAdd的1/12要大。比vectorAdd慢是因为多个线程不能同时读写一个数据，不然会造成数据竞争，原子操作避免了竞争但必须等其他线程访问结束。
 
 ### 批改反馈
+
+方向正确：`N` 很小时，v4 不一定比 v3 快，因为 two-pass 多出来的第二次 kernel launch 是固定开销，而小输入下能省掉的 atomic contention 很少。
+
+需要修正一句术语：这里不应说“几百次的 `atomicAdd` 的 occupancy”。`occupancy` 指的是 SM 上活跃 warps/blocks 的占用情况，不是 atomic 次数或 atomic 开销。更准确的说法是：当 `N` 只有几千时，v3 的 `partial_count = ceil(N / (blockDim.x * kItemsPerThread))` 可能只有 1 个或很少几个 block，最后对 `y` 的全局 `atomicAdd` 次数很少，同地址竞争本来就不严重；这时 v4 再启动第二个 kernel 的固定开销可能超过去掉这些 atomic 的收益。
+
+标准思路：
+
+- 第二次 kernel launch 开销：v4 固定多启动一个 `kernel_v4_stage2`，小 `N` 时总计算量很少，这个固定成本难以摊薄。
+- atomic contention：v3 的 atomic 次数等于 `partial_count`，小 `N` 下 `partial_count` 很小，竞争不明显；去掉它带来的收益有限。
+- 结论：小规模下 v4 不保证更快，甚至可能慢于 v3；需要实测不同 `N`，观察 v3 和 v4 的交叉点。
 
 reduce naive 每个元素大约做 1 次加法、读 1 个 float，总逻辑访存约 4N + 4 字节，所以 AI ≈ 0.25 FLOP/Byte，比 vector add 的 1/12 高。但它所有线程都对同一个输出地址执行 atomicAdd，同地址原子操作会发生严重竞争和串行化，很多线程在等待原子更新完成。因此实际性能可能远低于 vector add，瓶颈主要是 atomic contention，而不是普通的连续显存带宽。
 
@@ -148,9 +164,10 @@ v3_items16   ms:0.4610    GB/s: 36.39   TFLOPS: 0.0091   abs_err: 0.000366
 
 ### 我的答案
 
+v4使用启动两次kernel的方法，首先第一个kernel在此前的基础上进行第一次规约访存partial，第二个kernel对partial规约得到的就是最终的规约值y，因为不需要跨块对同一地址进行大量atomicAdd。同时partial_count足够大，足以抵消两次启动内核的开销。
+
 ### 自我检查
 
-需要说清：v4 仍然主要读同样的输入数据，FLOPs 也基本不变，所以 `AI` 不会明显提高；性能收益来自去掉跨 block 合并阶段对同一个 `y` 地址的全局 `atomicAdd` 竞争。
 
 ### 批改反馈
 
@@ -159,8 +176,9 @@ v3_items16   ms:0.4610    GB/s: 36.39   TFLOPS: 0.0091   abs_err: 0.000366
 
 ### 我的答案
 
+如果N只有几千个元素，partial_count的数量可能只有几百个，几百次的atomicAdd的occupancy很可能没有kernel launch的启动开销大。
+
 ### 自我检查
 
-需要考虑：小规模下 block 数少，v3 的 atomic contention 本来就弱；v4 多一次 kernel launch 和一次 partial 读写，固定开销可能抵消收益。
 
 ### 批改反馈

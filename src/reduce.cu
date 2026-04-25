@@ -16,7 +16,7 @@ namespace {
 
 constexpr int kBlockSize = 256;
 constexpr int kItemsPerThread = 16;
-constexpr int kNumElems = (1 << 22);
+constexpr int kNumElems = (1 << 24);
 constexpr int kBenchmarkWarmup = 3;
 constexpr int kBenchmarkIters = 20;
 
@@ -176,6 +176,7 @@ __global__ void kernel_v4_stage1(const float* x, float* partial, int n) {
     }
 }
 
+
 __global__ void kernel_v4_stage2(const float* partial, float* y, int partial_count) {
     __shared__ float smem[kBlockSize];
 
@@ -200,15 +201,12 @@ __global__ void kernel_v4_stage2(const float* partial, float* y, int partial_cou
     }
 }
 
-int partial_count_for(int n) {
-    return div_up(n, kBlockSize * kItemsPerThread);
-}
-
 void launch_v4(const float* x, float* y, float* partial, int n) {
-    int partial_count = partial_count_for(n);
+    int partial_count = div_up(n, kBlockSize * kItemsPerThread);
     kernel_v4_stage1<<<partial_count, kBlockSize>>>(x, partial, n);
     kernel_v4_stage2<<<1, kBlockSize>>>(partial, y, partial_count);
 }
+
 
 
 }  // namespace
@@ -218,7 +216,7 @@ int main() {
     const size_t input_bytes = static_cast<size_t>(n) * sizeof(float);
     const size_t output_bytes = sizeof(float);
     const size_t traffic_bytes = input_bytes + output_bytes;
-    const int partial_count = partial_count_for(n);
+    const int partial_count = div_up(n, kBlockSize * kItemsPerThread);
     const size_t partial_bytes = static_cast<size_t>(partial_count) * sizeof(float);
     const size_t traffic_bytes_v4 = input_bytes + 2 * partial_bytes + output_bytes;
     const size_t flops = static_cast<size_t>(n - 1);
