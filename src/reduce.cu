@@ -210,9 +210,13 @@ void launch_v4(const float* x, float* y, float* partial, int n) {
 }
 
 // ========= v5: warp shuffle block reduce =========
-// warp shuffle 让同一个 warp 内的线程直接交换 register 值，减少 shared memory 读写和部分 __syncthreads()。
+// warp shuffle 让同一个 warp 内的线程直接交换 register 值，
+// 减少 shared memory 读写和部分 __syncthreads()。
 __device__ float warp_reduce_sum(float value) {
+    // warp内规约
     for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        // 0xffffffff是warp掩膜; value表示给其他线程读取的register值; delta=offset向下读取距离
+        // __shfl_down_sync本身是warp-level同步交换指令，不用担心其他lane不同步
         value += __shfl_down_sync(0xffffffff, value, offset);
     }
     return value;
@@ -220,15 +224,20 @@ __device__ float warp_reduce_sum(float value) {
 
 __device__ float block_reduce_sum_v5(float value, float* warp_sums) {
     int tid = threadIdx.x;
+    // 线程在warp内的编号，kWarpSize-1作掩码，范围在0~31
     int lane = tid & (kWarpSize - 1);
+    // 当前warp的编号 
     int warp_id = tid / kWarpSize;
 
     value = warp_reduce_sum(value);
     if (lane == 0) {
         warp_sums[warp_id] = value;
     }
+
+    // 等待其他warp将value写入shared_memory
     __syncthreads();
 
+    // tid = (0 ~ 7) 的register置为warp_sums[tid]，其他线程置为0，防止归并时数据污染。
     value = (tid < kWarpsPerBlock) ? warp_sums[tid] : 0.0f;
     if (warp_id == 0) {
         value = warp_reduce_sum(value);
@@ -255,6 +264,7 @@ __global__ void kernel_v5_stage1(const float* x, float* partial, int n) {
         partial[blockIdx.x] = sum;
     }
 }
+
 
 __global__ void kernel_v5_stage2(const float* partial, float* y, int partial_count) {
     __shared__ float warp_sums[kWarpsPerBlock];

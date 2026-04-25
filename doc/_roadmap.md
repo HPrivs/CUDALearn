@@ -17,11 +17,15 @@
 
 **当前瓶颈**：输入读取 + 额外 kernel launch 开销 + 少量 block 内归约开销
 
+### Transpose（二维访存入门）
+1. naive：一个线程搬运一个元素，读连续、写跨 stride
+
+**当前瓶颈**：global memory 写入不连续，store coalescing 差
+
 ---
 
 ## 🔜 下一步候选
 
-- **Transpose** — 矩阵转置。入门经典，引出 **bank conflict** 和 SMEM padding 技巧
 - **GEMV** — 矩阵×向量。Reduce 的自然延伸，开始接触 2D tiling
 - **Softmax** — 行归约 + 指数归一化。引入 **online softmax**（单遍同时维护 max 和 sum）
 - **LayerNorm / RMSNorm** — 归一化层。复合 reduce + elementwise，工程中高频

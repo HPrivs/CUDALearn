@@ -209,11 +209,18 @@ v4的多了额外的partial读写，`2 * P * sizeof(float)`。总体来看，在
 
 ### 我的答案
 
+v5将v4的block reduce换成了warp reduce，降低了shared memory的访存流量，同时减少了block级的__syncthreads()，换为了更轻量的__shfl_down_sync();
 
 ### 自我检查
 
 
 ### 批改反馈
+
+基本正确。你抓住了 v5 和 v4 的关键差异：v5 没有改变 two-pass 结构、输入读取次数或总加法次数，因此按有效 DRAM 访存计算的 `AI` 和 v4 基本一样；它可能略快，是因为 block 内归约从 shared memory tree 改成 warp-level shuffle，减少了 shared memory 读写和多轮 block-wide `__syncthreads()`。
+
+需要把一句话再说严谨一点：v5 不是把整个 block reduce 都换成“纯 warp reduce”。它先在每个 warp 内用 `__shfl_down_sync` 归约，再把每个 warp 的 partial sum 写到 shared memory，最后由第一个 warp 继续归约这些 partial sums。所以 shared memory 没有完全消失，只是从 v4 的每个线程都写 `smem[tid]`、多轮读写，变成每个 warp 写 1 个结果，默认 `kBlockSize = 256` 时只写 8 个 `warp_sums`。
+
+标准答案可以压缩成：v5 的 `B` 和 `F` 与 v4 基本相同，所以 `AI` 基本不变；但 v5 用 `__shfl_down_sync` 在 warp 内直接交换 register 值，减少 block 内 shared memory 访问和同步次数，因此在 block reduce 开销占比较高时可能略快。
 
 
 ### 题目 2
@@ -221,8 +228,16 @@ v4的多了额外的partial读写，`2 * P * sizeof(float)`。总体来看，在
 
 ### 我的答案
 
+需要等待所有warp把数据存入shared memory中，如果删去可能会出现读取未完成warp reduce的value的情况。
 
 ### 自我检查
 
+“读取未完成warp reduce的value”说法不准确，应该说第一个warp可能读取到尚未写入或未定义的`warp_sums[i]`。`__shfl_down_sync`只能保证同一个warp内参与mask的lanes的同步交换register值。
 
 ### 批改反馈
+
+正确。这个 `__syncthreads()` 的作用是保证所有 warp 的 lane 0 都已经把各自的 warp partial sum 写入 `warp_sums[warp_id]`，然后第一个 warp 才读取 `warp_sums[0..kWarpsPerBlock-1]` 做第二级归约。
+
+更精确地说，问题不是“读取未完成 warp reduce 的 value”，而是第一个 warp 可能读取到尚未写入、旧值或未定义的 `warp_sums[i]`。`__shfl_down_sync` 只保证同一个 warp 内参与 mask 的 lanes 能同步交换 register 值；它不能同步不同 warp，也不能保证 shared memory 写入对其他 warp 可见。因此跨 warp 通过 shared memory 传递数据时，仍然需要 block-wide `__syncthreads()`。
+
+标准思路：warp 内归约不需要 block 同步；warp 之间通过 shared memory 合并时需要同步。删掉这次同步后，结果会变成 race condition，可能偶尔对、偶尔错，取决于 warp 调度和 shared memory 写读先后。
