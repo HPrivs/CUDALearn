@@ -22,7 +22,7 @@
 
 
 template <typename Launcher>
-float timeit(Launcher&& launcher, int warmup = 10, int iters = 100) {
+float timeit(Launcher&& launcher, int warmup = 3, int iters = 20) {
     for (int i = 0; i < warmup; ++i) {
         launcher();
     }

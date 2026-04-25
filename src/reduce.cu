@@ -15,8 +15,33 @@
 namespace {
 
 constexpr int kBlockSize = 256;
-constexpr int kItemsPerThread = 4;
+constexpr int kItemsPerThread = 16;
 constexpr int kNumElems = (1 << 22);
+constexpr int kBenchmarkWarmup = 3;
+constexpr int kBenchmarkIters = 20;
+
+template <typename Launcher>
+void benchmark_version(const char* version, Launcher&& launcher, const float* d_x,
+                       float* d_y, float* d_partial, int n, size_t traffic_bytes,
+                       size_t flops, const std::vector<float>& h_ref,
+                       std::vector<float>& h_out, int warmup, int iters) {
+    launcher(d_x, d_y, d_partial, n);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_y, sizeof(float), cudaMemcpyDeviceToHost));
+    float err = max_abs_err(h_out.data(), h_ref.data(), h_out.size());
+
+    float ms = timeit([&] { launcher(d_x, d_y, d_partial, n); }, warmup, iters);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    print_row(version, ms, traffic_bytes, flops, err);
+}
+
+
+int div_up(int a, int b) {
+    return (a + b - 1) / b;
+}
 
 void cpu_ref(const std::vector<float>& x, std::vector<float>& y) {
     double sum = 0.0;
@@ -36,9 +61,9 @@ __global__ void kernel_naive(const float* x, float* y, int n) {
     }
 }
 
-void launch_naive(const float* x, float* y, int n) {
+void launch_naive(const float* x, float* y, float* /*partial*/, int n) {
     CUDA_CHECK(cudaMemset(y, 0, sizeof(float)));
-    int grid = (n + kBlockSize - 1) / kBlockSize;
+    int grid = div_up(n, kBlockSize);
     kernel_naive<<<grid, kBlockSize>>>(x, y, n);
 }
 
@@ -63,14 +88,15 @@ __global__ void kernel_v2(const float* x, float* y, int n) {
         __syncthreads();
     }
 
+    // 每个线程块的smem[0]存储最终的规约结果，使用此结果进行原子加法
     if (tid == 0) {
         atomicAdd(y, smem[0]);
     }
 }
 
-void launch_v2(const float* x, float* y, int n) {
+void launch_v2(const float* x, float* y, float* /*partial*/, int n) {
     CUDA_CHECK(cudaMemset(y, 0, sizeof(float)));
-    int grid = (n + kBlockSize - 1) / kBlockSize;
+    int grid = div_up(n, kBlockSize);
     kernel_v2<<<grid, kBlockSize>>>(x, y, n);
 }
 
@@ -78,6 +104,50 @@ void launch_v2(const float* x, float* y, int n) {
 // 每个线程先在寄存器里累加多个连续批次的元素，再进入 shared memory 归约；
 // 这样可以减少 block 数和最终全局 atomicAdd 次数。
 __global__ void kernel_v3(const float* x, float* y, int n) {
+    __shared__ float smem[kBlockSize]; 
+
+    int tid = threadIdx.x;
+    
+    int block_start = blockIdx.x * blockDim.x * kItemsPerThread;
+    float sum = 0.0f;
+
+    // 此处仍然符合coalescing，合并访存看warp内所有线程访问的地址是否连续，
+    // 不是看单个线程前后两次访问是否连续
+    for (int i = 0; i < kItemsPerThread; ++i) {
+        int idx = block_start + i * blockDim.x + tid;
+        if (idx < n) {
+            sum += x[idx];
+        }
+    }
+
+    smem[tid] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicAdd(y, smem[0]);
+    }
+}
+
+void launch_v3(const float* x, float* y, float* /*partial*/, int n) {
+    CUDA_CHECK(cudaMemset(y, 0, sizeof(float)));
+    int elems_per_block = kBlockSize * kItemsPerThread;
+
+    // n不变，每个线程块处理 kItemsPerThread 倍元素，grid 相应缩小。
+    int grid = div_up(n, elems_per_block);
+    kernel_v3<<<grid, kBlockSize>>>(x, y, n);
+
+}
+
+// ========= v4: two-pass reduction =========
+// two-pass reduction 先把每个 block 的局部和写到 partial 数组，再二次归约，避免所有 block 争抢同一个 y。
+__global__ void kernel_v4_stage1(const float* x, float* partial, int n) {
     __shared__ float smem[kBlockSize];
 
     int tid = threadIdx.x;
@@ -102,17 +172,44 @@ __global__ void kernel_v3(const float* x, float* y, int n) {
     }
 
     if (tid == 0) {
-        atomicAdd(y, smem[0]);
+        partial[blockIdx.x] = smem[0];
     }
 }
 
-void launch_v3(const float* x, float* y, int n) {
-    CUDA_CHECK(cudaMemset(y, 0, sizeof(float)));
-    int elems_per_block = kBlockSize * kItemsPerThread;
-    int grid = (n + elems_per_block - 1) / elems_per_block;
-    kernel_v3<<<grid, kBlockSize>>>(x, y, n);
+__global__ void kernel_v4_stage2(const float* partial, float* y, int partial_count) {
+    __shared__ float smem[kBlockSize];
 
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    for (int idx = tid; idx < partial_count; idx += blockDim.x) {
+        sum += partial[idx];
+    }
+
+    smem[tid] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        y[0] = smem[0];
+    }
 }
+
+int partial_count_for(int n) {
+    return div_up(n, kBlockSize * kItemsPerThread);
+}
+
+void launch_v4(const float* x, float* y, float* partial, int n) {
+    int partial_count = partial_count_for(n);
+    kernel_v4_stage1<<<partial_count, kBlockSize>>>(x, partial, n);
+    kernel_v4_stage2<<<1, kBlockSize>>>(partial, y, partial_count);
+}
+
 
 }  // namespace
 
@@ -121,13 +218,18 @@ int main() {
     const size_t input_bytes = static_cast<size_t>(n) * sizeof(float);
     const size_t output_bytes = sizeof(float);
     const size_t traffic_bytes = input_bytes + output_bytes;
+    const int partial_count = partial_count_for(n);
+    const size_t partial_bytes = static_cast<size_t>(partial_count) * sizeof(float);
+    const size_t traffic_bytes_v4 = input_bytes + 2 * partial_bytes + output_bytes;
     const size_t flops = static_cast<size_t>(n - 1);
 
 
     float* d_x = nullptr;
     float* d_y = nullptr;
+    float* d_partial = nullptr;
     CUDA_CHECK(cudaMalloc(&d_x, input_bytes));
     CUDA_CHECK(cudaMalloc(&d_y, output_bytes));
+    CUDA_CHECK(cudaMalloc(&d_partial, partial_bytes));
 
     random_fill(d_x, n, 2028);
 
@@ -137,42 +239,17 @@ int main() {
 
     std::cout << "version            ms        GB/s     TFLOPS     max_err\n";
 
-    launch_naive(d_x, d_y, n);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    benchmark_version("naive", launch_naive, d_x, d_y, d_partial, n, traffic_bytes,
+                      flops, h_ref, h_out, kBenchmarkWarmup, kBenchmarkIters);
+    benchmark_version("v2_smem", launch_v2, d_x, d_y, d_partial, n, traffic_bytes,
+                      flops, h_ref, h_out, kBenchmarkWarmup, kBenchmarkIters);
+    benchmark_version("v3_items16", launch_v3, d_x, d_y, d_partial, n, traffic_bytes,
+                      flops, h_ref, h_out, kBenchmarkWarmup, kBenchmarkIters);
+    benchmark_version("v4_two_pass", launch_v4, d_x, d_y, d_partial, n,
+                      traffic_bytes_v4, flops, h_ref, h_out, kBenchmarkWarmup,
+                      kBenchmarkIters);
 
-    CUDA_CHECK(cudaMemcpy(h_out.data(), d_y, output_bytes, cudaMemcpyDeviceToHost));
-    float err = max_abs_err(h_out.data(), h_ref.data(), h_out.size());
-
-    float ms = timeit([&] { launch_naive(d_x, d_y, n); }, 3, 20);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-    print_row("naive", ms, traffic_bytes, flops, err);
-
-    launch_v2(d_x, d_y, n);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    CUDA_CHECK(cudaMemcpy(h_out.data(), d_y, output_bytes, cudaMemcpyDeviceToHost));
-    err = max_abs_err(h_out.data(), h_ref.data(), h_out.size());
-
-    ms = timeit([&] { launch_v2(d_x, d_y, n); }, 10, 100);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-    print_row("v2_smem", ms, traffic_bytes, flops, err);
-
-    launch_v3(d_x, d_y, n);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    CUDA_CHECK(cudaMemcpy(h_out.data(), d_y, output_bytes, cudaMemcpyDeviceToHost));
-    err = max_abs_err(h_out.data(), h_ref.data(), h_out.size());
-
-    ms = timeit([&] { launch_v3(d_x, d_y, n); }, 10, 100);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-    print_row("v3_items4", ms, traffic_bytes, flops, err);
-
+    CUDA_CHECK(cudaFree(d_partial));
     CUDA_CHECK(cudaFree(d_x));
     CUDA_CHECK(cudaFree(d_y));
     return 0;

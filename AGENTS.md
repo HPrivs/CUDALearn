@@ -152,7 +152,6 @@ root/
 ## v2 — <手段>
 ...
 ## 对比总表
-## 作业
 ## 参考资料
 ```
 
@@ -196,7 +195,7 @@ root/
 ## `common.cuh` 应提供
 
 - `CUDA_CHECK(expr)`。
-- `float timeit(launcher_lambda, int warmup=10, int iters=20)`。
+- `float timeit(launcher_lambda, int warmup=3, int iters=20)`。
 - `random_fill<T>(T* d_ptr, size_t n, unsigned seed)`。
 - `max_abs_err<T>(const T* a, const T* b, size_t n)`：失败时打印首个坏下标。
 - `print_row(const char* version, float ms, size_t bytes, size_t flops, float err)`：打印 `ms / 有效 GB/s / TFLOPS / max_err`。
@@ -205,6 +204,9 @@ root/
 
 - correctness 失败时，先修正确性，不继续讨论性能。
 - benchmark 必须包含 warmup，计时前后同步，错误检查不能省略。
+- 默认 benchmark 使用 `warmup=3, iters=20`，优先保证每轮反馈快、能稳定比较版本趋势。
+- 若单次 kernel 很慢，允许临时降低 `iters`，但必须在文档或输出中写明次数。
+- 若计时波动明显、优化幅度很小，或要写入阶段性结论，应提高到如 `warmup=10, iters=100`，或重复多轮并报告最小值、均值或重复次数。
 - 同一个算子的所有版本使用同一输入规模、同一 seed、同一误差阈值。
 - `GB/s` 使用有效访存字节计算；`TFLOPS` 使用本算子定义的有效 FLOPs 计算。
 - 如果计时波动明显，报告中说明最小值、均值或重复次数，不只挑一个好看的数。
@@ -222,7 +224,7 @@ root/
 - 后续版本只追加 `## vN 作业`，不得覆盖用户答案。
 - 每道题预留「我的答案」「自我检查」「批改反馈」三个位置。
 - 用户请求批改作业时，默认把该文件视为主要批改对象。
-- 批改完成后，需要给出相应批改反馈。
+- 批改完成后，在作业文档中需要给出相应批改反馈。
 
 按阶段选题：
 
