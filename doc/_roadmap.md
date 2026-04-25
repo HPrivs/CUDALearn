@@ -13,8 +13,9 @@
 2. shared memory block reduce：每个 block 先做局部归约，再执行一次全局 atomicAdd
 3. per-thread accumulation：每个线程先在 register 中累加多个元素，再进入 shared memory 归约
 4. two-pass reduction：第一轮写 partial sums，第二轮归约 partial，去掉跨 block 同地址 atomic 竞争
+5. warp shuffle block reduce：warp 内用 `__shfl_down_sync` 归约，减少 shared memory 读写和部分同步
 
-**当前瓶颈**：输入读取 + block 内同步开销 + shared memory 归约开销 + 额外 kernel launch 开销
+**当前瓶颈**：输入读取 + 额外 kernel launch 开销 + 少量 block 内归约开销
 
 ---
 

@@ -1,7 +1,7 @@
 // Reduce Sum: y = sum_i x[i]
 // I/O shape: x is a 1D vector with N elements, y is one scalar
 // dtype: float32
-// default problem size: N = 1 << 22
+// default problem size: N = 1 << 24
 // theoretical traffic per element: read x[i] 4B, plus one final output float
 // theoretical FLOPs per element: approximately 1 floating-point add
 
@@ -16,6 +16,8 @@ namespace {
 
 constexpr int kBlockSize = 256;
 constexpr int kItemsPerThread = 16;
+constexpr int kWarpSize = 32;
+constexpr int kWarpsPerBlock = kBlockSize / kWarpSize;
 constexpr int kNumElems = (1 << 24);
 constexpr int kBenchmarkWarmup = 3;
 constexpr int kBenchmarkIters = 20;
@@ -207,6 +209,74 @@ void launch_v4(const float* x, float* y, float* partial, int n) {
     kernel_v4_stage2<<<1, kBlockSize>>>(partial, y, partial_count);
 }
 
+// ========= v5: warp shuffle block reduce =========
+// warp shuffle 让同一个 warp 内的线程直接交换 register 值，减少 shared memory 读写和部分 __syncthreads()。
+__device__ float warp_reduce_sum(float value) {
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffff, value, offset);
+    }
+    return value;
+}
+
+__device__ float block_reduce_sum_v5(float value, float* warp_sums) {
+    int tid = threadIdx.x;
+    int lane = tid & (kWarpSize - 1);
+    int warp_id = tid / kWarpSize;
+
+    value = warp_reduce_sum(value);
+    if (lane == 0) {
+        warp_sums[warp_id] = value;
+    }
+    __syncthreads();
+
+    value = (tid < kWarpsPerBlock) ? warp_sums[tid] : 0.0f;
+    if (warp_id == 0) {
+        value = warp_reduce_sum(value);
+    }
+    return value;
+}
+
+__global__ void kernel_v5_stage1(const float* x, float* partial, int n) {
+    __shared__ float warp_sums[kWarpsPerBlock];
+
+    int tid = threadIdx.x;
+    int block_start = blockIdx.x * blockDim.x * kItemsPerThread;
+    float sum = 0.0f;
+
+    for (int i = 0; i < kItemsPerThread; ++i) {
+        int idx = block_start + i * blockDim.x + tid;
+        if (idx < n) {
+            sum += x[idx];
+        }
+    }
+
+    sum = block_reduce_sum_v5(sum, warp_sums);
+    if (tid == 0) {
+        partial[blockIdx.x] = sum;
+    }
+}
+
+__global__ void kernel_v5_stage2(const float* partial, float* y, int partial_count) {
+    __shared__ float warp_sums[kWarpsPerBlock];
+
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    for (int idx = tid; idx < partial_count; idx += blockDim.x) {
+        sum += partial[idx];
+    }
+
+    sum = block_reduce_sum_v5(sum, warp_sums);
+    if (tid == 0) {
+        y[0] = sum;
+    }
+}
+
+void launch_v5(const float* x, float* y, float* partial, int n) {
+    int partial_count = div_up(n, kBlockSize * kItemsPerThread);
+    kernel_v5_stage1<<<partial_count, kBlockSize>>>(x, partial, n);
+    kernel_v5_stage2<<<1, kBlockSize>>>(partial, y, partial_count);
+}
+
 
 
 }  // namespace
@@ -244,6 +314,9 @@ int main() {
     benchmark_version("v3_items16", launch_v3, d_x, d_y, d_partial, n, traffic_bytes,
                       flops, h_ref, h_out, kBenchmarkWarmup, kBenchmarkIters);
     benchmark_version("v4_two_pass", launch_v4, d_x, d_y, d_partial, n,
+                      traffic_bytes_v4, flops, h_ref, h_out, kBenchmarkWarmup,
+                      kBenchmarkIters);
+    benchmark_version("v5_warp_shuffle", launch_v5, d_x, d_y, d_partial, n,
                       traffic_bytes_v4, flops, h_ref, h_out, kBenchmarkWarmup,
                       kBenchmarkIters);
 
