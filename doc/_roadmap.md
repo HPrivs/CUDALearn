@@ -24,11 +24,15 @@
 
 **当前瓶颈**：仍是 memory-bound；padding 在当前 GP108 上未稳定提速，下一步更适合转向 GEMV
 
+### GEMV（矩阵×向量）
+1. naive：一个线程计算一整行 dot product
+
+**当前瓶颈**：memory-bound + 行内串行累加，下一步适合用 block 内并行 reduce
+
 ---
 
 ## 🔜 下一步候选
 
-- **GEMV** — 矩阵×向量。Reduce 的自然延伸，开始接触 2D tiling
 - **Softmax** — 行归约 + 指数归一化。引入 **online softmax**（单遍同时维护 max 和 sum）
 - **LayerNorm / RMSNorm** — 归一化层。复合 reduce + elementwise，工程中高频
 - **GEMM** — 矩阵乘法。CUDA 优化"终极 boss"，串联几乎所有手段：SMEM tile / register tile / double buffer / `cp.async` / Tensor Core / swizzle
