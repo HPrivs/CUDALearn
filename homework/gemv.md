@@ -69,11 +69,19 @@ __global__ void kernel_naive(const float* a, const float* x, float* y,
 
 ### 我的答案
 
+v1内核让线程块处理多行A，而每行分配的协作线程数为1,导致了每个线程所需处理K列的数据，因此每线程串行循环长度为K。v2内核则让一个线程块处理一行A，这样每行协作线程数则为kBlockSize，每线程串行循环长度为div_up(K, kBlockSize)，行内并行数从1提升到了kBlockSize，因此速度明显变快。
 
 ### 自我检查
 
 
 ### 批改反馈
+
+正确。
+
+关键理解是对的：`v1/naive` 中一个线程独自处理一整行，所以每个线程要串行循环 `K` 次；`v2` 中一个 block 处理一行，默认 `kBlockSize = 256` 个线程协作，因此每个线程大约只处理 `ceil(K / 256)` 个列元素。`AI` 仍然接近 `0.25 FLOP/Byte`，因为有效读写字节和有效 FLOPs 没有变；速度提升主要来自行内并行度提升，而不是算法的算术强度提升。
+
+
+所以这题的标准表达是：`v2` 把每行协作线程数从 `1` 提升到 `kBlockSize`，把每个线程的串行循环长度从 `K` 降到约 `ceil(K / kBlockSize)`，因此即使 `AI` 几乎不变，实测也能明显变快。
 
 
 ### 题目 2
@@ -100,6 +108,42 @@ __global__ void kernel_v2_bug(const float* a, const float* x, float* y,
     }
 }
 ```
+
+### 我的答案
+
+1、没有判断row < rows，可能发生y[row], a[row * cols + col]数组越界。
+2、同时每次为smem赋值并没有__syncthreads()同步线程块，这样可能导致smem规约数据混乱，y[row]也相应出错。
+
+
+### 自我检查
+
+2应该说保证smem读取的是上一轮规约后的结果，防止读取旧值或者未写完值。
+
+### 批改反馈
+
+正确，两个关键 bug 都指出来了。
+
+1. 缺少 `row < rows` 边界检查：如果 launch 的 grid 大于 `rows`，会访问 `a[row * cols + col]` 和 `y[row]` 的越界地址。当前项目里 `launch_v2` 用 `kernel_v2<<<rows, kBlockSize>>>`，刚好不会产生多余 block，但健壮写法仍应保留边界判断，尤其是以后改 grid 组织方式时。
+2. 缺少 `__syncthreads()`：`smem[tid] = sum` 后必须同步，保证所有线程都写完 partial sum；每一轮 `smem[tid] += smem[tid + stride]` 后也必须同步，保证下一轮读取的是上一轮归约后的结果。否则会出现读旧值、读未写完值，最终 `y[row]` 不稳定或错误。
+
+更完整的标准思路是：写入 `smem` 后一次同步，归约循环中每轮加法后一次同步，最后只让 `tid == 0` 写回结果；如果 grid 可能超过 `rows`，读写 `a/y` 都要受 `row < rows` 保护。
+
+## v3 作业
+
+### 题目 1
+预测题：如果把 `kRowsPerBlock` 从 `4` 改成 `8`，每行协作线程数会变成多少？它可能更快还是更慢？请从“每行线程数”和“block 数”两个角度说明。
+
+### 我的答案
+
+
+### 自我检查
+
+
+### 批改反馈
+
+
+### 题目 2
+概念题：为什么 `v3` 的 `AI` 和 `v2` 几乎相同，但 `v3` 仍可能更快？
 
 ### 我的答案
 

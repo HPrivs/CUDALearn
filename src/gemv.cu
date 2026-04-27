@@ -19,6 +19,8 @@ namespace {
 constexpr int kRows = 4096;
 constexpr int kCols = 4096;
 constexpr int kBlockSize = 256;
+constexpr int kRowsPerBlock = 4;
+constexpr int kThreadsPerRow = kBlockSize / kRowsPerBlock;
 
 int div_up(int a, int b) {
     return (a + b - 1) / b;
@@ -60,16 +62,15 @@ void launch_naive(const float* a, const float* x, float* y, int rows, int cols) 
 // ========= v2: block-per-row shared memory reduce =========
 // shared memory block reduce 解决的问题：让一个 block 内的多个线程共同计算同一行，
 // 再在片上 shared memory 中合并 partial sum，减少单线程串行累加时间。
-__global__ void kernel_v2(const float* a, const float* x, float* y, int rows,
-                          int cols) {
-    __shared__ float smem[kBlockSize];
 
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
+__global__ void kernel_v2(const float* a, const float* x, float* y, int rows, int cols) {
+    __shared__ float smem[kBlockSize];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
     float sum = 0.0f;
 
     if (row < rows) {
-        const size_t row_offset = static_cast<size_t>(row) * cols;
+        int row_offset = static_cast<size_t>(row) * cols;
         for (int col = tid; col < cols; col += blockDim.x) {
             sum += a[row_offset + col] * x[col];
         }
@@ -88,11 +89,53 @@ __global__ void kernel_v2(const float* a, const float* x, float* y, int rows,
     if (row < rows && tid == 0) {
         y[row] = smem[0];
     }
+
 }
 
 void launch_v2(const float* a, const float* x, float* y, int rows, int cols) {
     kernel_v2<<<rows, kBlockSize>>>(a, x, y, rows, cols);
 }
+
+// ========= v3: multi-row per block =========
+// multi-row per block 解决的问题：把一个 block 拆成多个 thread group，
+// 同时处理多行，减少 block 数并观察每行线程数减少后的取舍。
+__global__ void kernel_v3(const float* a, const float* x, float* y, int rows,
+                          int cols) {
+    __shared__ float smem[kRowsPerBlock][kThreadsPerRow];
+
+    int tid = threadIdx.x;
+    int local_row = tid / kThreadsPerRow;
+    int lane = tid % kThreadsPerRow;
+    int row = blockIdx.x * kRowsPerBlock + local_row;
+
+    float sum = 0.0f;
+    if (row < rows) {
+        const size_t row_offset = static_cast<size_t>(row) * cols;
+        for (int col = lane; col < cols; col += kThreadsPerRow) {
+            sum += a[row_offset + col] * x[col];
+        }
+    }
+
+    smem[local_row][lane] = sum;
+    __syncthreads();
+
+    for (int stride = kThreadsPerRow / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            smem[local_row][lane] += smem[local_row][lane + stride];
+        }
+        __syncthreads();
+    }
+
+    if (row < rows && lane == 0) {
+        y[row] = smem[local_row][0];
+    }
+}
+
+void launch_v3(const float* a, const float* x, float* y, int rows, int cols) {
+    int grid = div_up(rows, kRowsPerBlock);
+    kernel_v3<<<grid, kBlockSize>>>(a, x, y, rows, cols);
+}
+
 
 }  // namespace
 
@@ -127,9 +170,10 @@ int main() {
         void (*launch)(const float*, const float*, float*, int, int);
     };
 
-    const std::array<Version, 2> versions{{
+    const std::array<Version, 3> versions{{
         {"naive", launch_naive},
-        {"v2_block_reduce", launch_v2}
+        {"v2_block_reduce", launch_v2},
+        {"v3_multi_row", launch_v3}
     }};
 
     for (const auto& version : versions) {

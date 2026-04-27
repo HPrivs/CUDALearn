@@ -219,12 +219,117 @@ __global__ void kernel_v2_bug(const float* a, const float* x, float* y,
 }
 ```
 
+## v3 — multi-row per block
+
+### 本版学习目标
+本轮只引入一个新手段：让一个 block 同时处理多行。目标不是改变 GEMV 的数学工作量，而是观察 block 组织方式如何影响 block 数、每行协作线程数和 block 内归约开销。
+
+multi-row per block：一个 thread block 内分出多个 thread group，每个 group 负责一行输出。本版使用 `kRowsPerBlock = 4`，所以一个 `256` 线程 block 被拆成 4 组，每组 `64` 个线程。
+
+### 改了什么
+`v2` 是一个 block 负责一行：
+
+- `row = blockIdx.x`
+- 每行 `256` 个线程协作
+- 默认 `M = 4096` 时启动 `4096` 个 block
+
+`v3` 改成一个 block 负责 4 行：
+
+- `local_row = threadIdx.x / 64`
+- `lane = threadIdx.x % 64`
+- `row = blockIdx.x * 4 + local_row`
+- 每行 `64` 个线程协作
+- 默认 `M = 4096` 时启动 `1024` 个 block
+
+### 为什么可能更快
+`v3` 没有减少读 `A`、读 `x`、写 `y` 的有效字节，也没有减少 GEMV 的有效 FLOPs。它可能更快的原因是调度和归约粒度变了。
+
+默认规模下，`v2` 每行 256 个线程，每个线程大约读取 `4096 / 256 = 16` 个元素，然后做 8 轮 shared memory 归约。`v3` 每行 64 个线程，每个线程大约读取 `4096 / 64 = 64` 个元素，然后做 6 轮 shared memory 归约。也就是说，`v3` 用更长的线程内串行循环，换更少的 block、更少的线程总数和更短的归约链。
+
+这个取舍成立的前提是：每行 64 个线程仍然足够提供访存并行度。如果 `K` 非常大，或者 GPU 需要更多并行请求来打满带宽，`v3` 可能慢于 `v2`。
+
+### 代码要点
+- `kRowsPerBlock = 4`，`kThreadsPerRow = 64`。
+- `threadIdx.x / kThreadsPerRow` 决定当前线程负责 block 内第几行。
+- `threadIdx.x % kThreadsPerRow` 决定当前线程在这一行里的 lane。
+- `smem[kRowsPerBlock][kThreadsPerRow]` 给每一行单独保存 partial sum，避免不同输出行互相混在一起。
+- `row < rows` 仍然必须保留，因为最后一个 block 可能只覆盖 1 到 3 个有效行。
+
+### 定量分析
+按有效逻辑字节计算，`v3` 与 `v2` 相同：每个输出行读一行 `A`、逻辑上读一遍 `x`、写一个 `y`。
+
+| 量 | 表达式 | 说明 |
+| --- | --- | --- |
+| 访存字节 `B` | `M * K * 4 + M * K * 4 + M * 4` | 读 `A`，每行逻辑读取一次 `x`，写 `y` |
+| FLOPs `F` | `M * (2K - 1)` | 按 GEMV 数学定义统计有效乘加 |
+| 算术强度 `AI` | `F / B ≈ 0.25 FLOP/Byte` | 有效口径下与 `v2` 基本相同 |
+
+关键变化不在 `AI`，而在并行组织：
+
+| 项目 | v2 | v3 |
+| --- | ---: | ---: |
+| 每个 block 处理行数 | 1 | 4 |
+| 每行协作线程数 | 256 | 64 |
+| 默认 block 数 | 4096 | 1024 |
+| 每线程主要读取元素数 | 约 16 | 约 64 |
+| 每行归约轮数 | 8 | 6 |
+
+瓶颈定性判定：**memory-bound + granularity-sensitive**。`AI` 仍然很低，所以 GEMV 主要还是受输入读取和 cache 行为限制；但 `v3` 说明 block 粒度和每行线程数也会影响实测时间。
+
+可验证的 NCU metric 名沿用 `v2` 的检查重点：
+- `dram__bytes.sum`
+- `dram__throughput.avg.pct_of_peak_sustained_elapsed`
+- `sm__throughput.avg.pct_of_peak_sustained_elapsed`
+- `smsp__inst_executed.sum`
+- `smsp__sass_thread_inst_executed_op_ffma_pred_on.sum`
+- `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum`
+- `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum`
+
+当前机器上 `ncu --query-metrics` 返回 `Skipping unsupported chip GP108`，所以本轮没有 profiler 实测。后续在支持 Nsight Compute 的 GPU 上验证时，重点比较 `v2` 和 `v3` 的 DRAM 吞吐、SM 吞吐，以及 shared memory 读写冲突是否明显变化。
+
+### 实测结果
+用下面命令重新编译并实测：
+
+```bash
+nvcc src/gemv.cu -o debugger/gemv && ./debugger/gemv
+```
+
+当前记录，默认 `M = 4096, K = 4096`，`timeit` 使用 `warmup=3, iters=20`：
+
+| version | ms | GB/s | TFLOPS | max_err |
+| --- | ---: | ---: | ---: | ---: |
+| naive | 5.8082 | 23.11 | 0.0058 | 0.000168 |
+| v2_block_reduce | 1.5058 | 89.14 | 0.0223 | 0.000010 |
+| v3_multi_row | 1.3949 | 96.23 | 0.0241 | 0.000011 |
+
+现象：`v3_multi_row` 比 `v2_block_reduce` 约快 `1.08x`。提升不大，但方向符合本轮预期：默认规模下，每行 64 个线程仍能提供足够并行度，同时减少了 block 数和 shared memory 归约轮数。
+
+可能原因：`v3` 把 block 数从 `4096` 降到 `1024`，并把每行归约轮数从 8 降到 6；这些节省抵消了每线程串行循环从约 16 增加到约 64 的代价。由于默认 benchmark 只有 `warmup=3, iters=20`，这种小幅提升需要多轮重复才能写成稳定结论。
+
+### 当前瓶颈
+当前版本仍然主要是 memory-bound。`v3` 改善的是执行粒度和归约成本，不是有效访存字节；`A` 的读取仍然占主要数据量，`x` 的真实 DRAM 复用仍需要 profiler 验证。
+
+当 `K` 更大时，`v2` 的 256 线程每行可能提供更高的行内并行度；当 `K` 更小时，`v3` 的更少 block 和更短归约链可能更占优。这个版本的价值在于建立“同一个算法，block 组织也会改变性能”的判断框架。
+
+### 代价或限制
+- 每行协作线程数从 256 降到 64，行内并行度变小。
+- 每个线程的串行循环更长，可能降低隐藏内存延迟的能力。
+- `kRowsPerBlock = 4` 是当前教学参数，不是通用最优值；实际应测试 `2/4/8` 等配置。
+
+### 下一步
+下一版更适合观察 `x` 的读取路径，例如尝试 read-only cache / `__ldg` 或者先做参数实验，比较不同 `kRowsPerBlock` 对性能的影响。若继续保持“一轮一个手段”，建议下一轮先做参数实验，不急着叠加新的访存优化。
+
+### v3 作业
+1. 预测题：如果把 `kRowsPerBlock` 从 `4` 改成 `8`，每行协作线程数会变成多少？它可能更快还是更慢？请从“每行线程数”和“block 数”两个角度说明。
+2. 概念题：为什么 `v3` 的 `AI` 和 `v2` 几乎相同，但 `v3` 仍可能更快？
+
 ## 对比总表
 
 | version | 核心方法 | ms | GB/s | TFLOPS | max_err | 当前瓶颈 |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| naive | 一个线程计算一行 | 5.8505 | 22.94 | 0.0057 | 0.000168 | memory-bound + 行内串行 |
-| v2_block_reduce | 一个 block 计算一行，shared memory 归约 | 1.4909 | 90.03 | 0.0225 | 0.000010 | memory-bound + block reduce overhead |
+| naive | 一个线程计算一行 | 5.8082 | 23.11 | 0.0058 | 0.000168 | memory-bound + 行内串行 |
+| v2_block_reduce | 一个 block 计算一行，shared memory 归约 | 1.5058 | 89.14 | 0.0223 | 0.000010 | memory-bound + block reduce overhead |
+| v3_multi_row | 一个 block 同时处理 4 行，每行 64 线程归约 | 1.3949 | 96.23 | 0.0241 | 0.000011 | memory-bound + block 粒度取舍 |
 
 ## 参考资料
 - 本项目 `src/gemv.cu`

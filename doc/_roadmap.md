@@ -33,10 +33,11 @@
 ### GEMV（矩阵×向量）
 1. naive：一个线程计算一整行 dot product
 2. block-per-row reduce：一个 block 负责一行，多个线程并行计算 partial sum，再做 block 内归约
+3. multi-row per block：一个 block 同时处理多行，减少 block 数并观察每行线程数的取舍
 
-**当前瓶颈**：memory-bound + block 内 shared memory 归约和同步开销；`x` 的实际 DRAM 复用还需要 profiler 验证。
+**当前瓶颈**：memory-bound + block 粒度取舍；`x` 的实际 DRAM 复用还需要 profiler 验证。
 
-**后续参考**：multi-row per block、cache / read-only path 观察、vectorized load / unroll。
+**后续参考**：不同 `kRowsPerBlock` 参数实验、cache / read-only path 观察、vectorized load / unroll。
 
 ---
 
