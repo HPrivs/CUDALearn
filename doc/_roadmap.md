@@ -8,6 +8,8 @@
 
 **瓶颈演进**：始终 memory-bound，目标逼近 DRAM 带宽峰值
 
+**后续参考**：可选做 scalar/unroll 对照、对齐与非对齐 `float4` 对照，用来理解向量化访存的适用条件。
+
 ### Reduce / Sum（入门第二步）
 1. naive：atomicAdd 到全局变量（正确但极慢）
 2. shared memory block reduce：每个 block 先做局部归约，再执行一次全局 atomicAdd
@@ -17,6 +19,8 @@
 
 **当前瓶颈**：输入读取 + 额外 kernel launch 开销 + 少量 block 内归约开销
 
+**后续参考**：可选做 vectorized load + multiple elements per thread，对比是否真的受 global load 指令数量限制。
+
 ### Transpose（二维访存入门）
 1. naive：一个线程搬运一个元素，读连续、写跨 stride
 2. shared memory tiled transpose：用 shared memory 暂存 tile，交换 block 坐标后连续写回
@@ -24,17 +28,72 @@
 
 **当前瓶颈**：仍是 memory-bound；padding 在当前 GP108 上未稳定提速，下一步更适合转向 GEMV
 
+**后续参考**：可选做 vectorized transpose 或不同 tile shape，对比 global transaction 与 occupancy 的取舍。
+
 ### GEMV（矩阵×向量）
 1. naive：一个线程计算一整行 dot product
+2. block-per-row reduce：一个 block 负责一行，多个线程并行计算 partial sum，再做 block 内归约
 
-**当前瓶颈**：memory-bound + 行内串行累加，下一步适合用 block 内并行 reduce
+**当前瓶颈**：memory-bound + block 内 shared memory 归约和同步开销；`x` 的实际 DRAM 复用还需要 profiler 验证。
+
+**后续参考**：multi-row per block、cache / read-only path 观察、vectorized load / unroll。
 
 ---
 
 ## 🔜 下一步候选
 
-- **Softmax** — 行归约 + 指数归一化。引入 **online softmax**（单遍同时维护 max 和 sum）
-- **LayerNorm / RMSNorm** — 归一化层。复合 reduce + elementwise，工程中高频
-- **GEMM** — 矩阵乘法。CUDA 优化"终极 boss"，串联几乎所有手段：SMEM tile / register tile / double buffer / `cp.async` / Tensor Core / swizzle
-- **Conv2d** — 二维卷积。im2col+GEMM / implicit GEMM / Winograd
-- **Attention** — FlashAttention 式，Q/K/V 分块 + online softmax，S 不落 HBM（建议在 GEMM 和 Softmax 之后再学）
+下面步骤是路线参考，不代表已经实现或已经实测；实际学习时仍然每轮只引入一个主要优化手段。
+
+### Softmax（行归约 + 指数归一化）
+学习价值：把 max reduce、sum reduce 和 elementwise 组合成一个常见深度学习算子。
+
+推荐步骤：
+1. naive multi-pass：每行分别求 max、求 exp sum、写归一化结果
+2. block-per-row softmax：一个 block 处理一行，在 shared memory / register 中做行内归约
+3. online softmax：单遍维护 running max 和 running sum，减少中间读写
+4. vectorized load/store：按连续列方向用 `float4` 读写，处理尾部边界
+5. warp-level softmax：短行场景下用 warp shuffle 减少 shared memory 和同步
+
+### LayerNorm / RMSNorm（归一化层）
+学习价值：练习“reduce 统计量 + elementwise 写回”的融合，工程中高频。
+
+推荐步骤：
+1. naive multi-pass LayerNorm：分别求 mean、variance，再归一化写回
+2. block-per-row reduce：一个 block 处理一行，shared memory 归约 mean 和 variance
+3. Welford variance：用数值更稳定的在线方差统计替代简单平方和
+4. fused affine：把 `gamma/beta` 缩放平移融合到归一化 kernel
+5. RMSNorm：去掉 mean，只计算均方根，对比访存、FLOPs 和数值差异
+
+### GEMM（矩阵乘法）
+学习价值：串联二维 tiling、shared memory 复用、register tile 和更高阶的矩阵乘优化。
+
+推荐步骤：
+1. naive：一个线程计算一个 `C[row, col]`
+2. shared memory tile：把 `A/B` tile 搬到 shared memory，减少 global memory 重复读取
+3. register tile：一个线程计算多个输出元素，提高每次读入数据的复用
+4. vectorized global load：用连续向量化访存改善 global load/store 指令效率
+5. double buffering：计算当前 tile 时预取下一 tile，隐藏部分访存延迟
+6. `cp.async`（硬件支持时）：异步拷贝 global 到 shared memory，减少同步等待
+7. Tensor Core（硬件支持时）：用 WMMA / MMA 提高低精度矩阵乘吞吐
+
+### Conv2d（二维卷积）
+学习价值：理解卷积如何转化或映射成矩阵乘，并观察数据复用与边界处理。
+
+推荐步骤：
+1. naive direct conv：一个线程计算一个输出元素，先保证 padding/stride/dilation 正确
+2. shared memory input tile：缓存输入 patch，减少相邻输出重复读取
+3. constant / read-only filter：小卷积核权重走更适合广播或缓存的路径
+4. im2col + GEMM：把卷积转成矩阵乘，复用 GEMM 优化经验
+5. implicit GEMM：不显式落地 im2col，减少额外 HBM 读写
+6. Winograd（小 kernel 可选）：用更多变换换取更少乘法，重点分析适用范围
+
+### Attention（Q/K/V 分块 + online softmax）
+学习价值：把 GEMM、Softmax 和分块访存融合起来，理解为什么 FlashAttention 能减少 HBM 往返。
+
+推荐步骤：
+1. naive attention：显式计算 `S = QK^T`、softmax、再乘 `V`
+2. tiled QK：分块计算 score，建立 Q/K tile 的 shared memory 复用
+3. online softmax per block：分块更新每行 max 和 sum，避免完整 `S` 落 HBM
+4. fused `P * V` accumulation：softmax 结果不完整写回，直接累加输出
+5. causal mask / padding mask：加入真实模型常见边界条件
+6. double buffering / Tensor Core（硬件支持时）：进一步提高 tile 计算吞吐
