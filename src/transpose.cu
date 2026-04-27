@@ -15,7 +15,7 @@
 
 namespace {
 
-constexpr int kTileDim = 16;
+constexpr int kTileDim = 32;
 constexpr int kRows = 4096;
 constexpr int kCols = 4096;
 
@@ -83,6 +83,36 @@ void launch_v2(const float* a, float* b, int rows, int cols) {
 
 }
 
+// ========= v3: shared memory padding =========
+// shared memory padding 解决的问题：给每行多留 1 个 float，
+// 让按列读取 tile 时相邻线程更少落到同一个 shared memory bank。
+__global__ void kernel_v3(const float* a, float* b, int rows, int cols) {
+    __shared__ float smem[kTileDim][kTileDim + 1];
+
+    int tid_x = threadIdx.x;
+    int tid_y = threadIdx.y;
+    int in_col = blockIdx.x * blockDim.x + tid_x;
+    int in_row = blockIdx.y * blockDim.y + tid_y;
+
+    if (in_col < cols && in_row < rows) {
+        smem[tid_y][tid_x] = a[static_cast<size_t>(in_row) * cols + in_col];
+    }
+    __syncthreads();
+
+    int out_col = blockIdx.y * blockDim.x + tid_x;
+    int out_row = blockIdx.x * blockDim.y + tid_y;
+
+    if (out_col < rows && out_row < cols) {
+        b[static_cast<size_t>(out_row) * rows + out_col] = smem[tid_x][tid_y];
+    }
+}
+
+void launch_v3(const float* a, float* b, int rows, int cols) {
+    dim3 block(kTileDim, kTileDim);
+    dim3 grid(div_up(cols, block.x), div_up(rows, block.y));
+    kernel_v3<<<grid, block>>>(a, b, rows, cols);
+}
+
 }  // namespace
 
 int main() {
@@ -110,9 +140,10 @@ int main() {
         void (*launch)(const float*, float*, int, int);
     };
 
-    const std::array<Version, 2> versions{{
+    const std::array<Version, 3> versions{{
         {"naive", launch_naive},
-        {"v2", launch_v2}
+        {"v2", launch_v2},
+        {"v3", launch_v3}
     }};
 
     for (const auto& version : versions) {
