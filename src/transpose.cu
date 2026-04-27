@@ -49,6 +49,39 @@ void launch_naive(const float* a, float* b, int rows, int cols) {
     dim3 grid(div_up(cols, block.x), div_up(rows, block.y));
     kernel_naive<<<grid, block>>>(a, b, rows, cols);
 }
+// ========= v2: shared memory tiled transpose =========
+// shared memory tile 解决的问题：先把输入 tile 暂存下来，
+// 再交换 block 坐标写出，让 global load 和 global store 都沿连续地址访问。
+__global__ void kernel_v2(const float* a, float* b, int rows, int cols) {    
+    __shared__ float smem[kTileDim][kTileDim];
+
+    int tid_x = threadIdx.x;
+    int tid_y = threadIdx.y;
+    int in_col = blockIdx.x * blockDim.x + tid_x; 
+    int in_row = blockIdx.y * blockDim.y + tid_y;
+
+    if (in_col < cols && in_row < rows) {
+        smem[tid_y][tid_x] = a[static_cast<size_t>(in_row) * cols + in_col];
+    }
+    __syncthreads();
+
+    // 块位置调换
+    int out_col = blockIdx.y * blockDim.x + tid_x;
+    int out_row = blockIdx.x * blockDim.y + tid_y;
+
+    // b的形状是 cols * rows 所以要调换一下
+    if (out_col < rows && out_row < cols) {
+        b[static_cast<size_t>(out_row) * rows + out_col] = smem[tid_x][tid_y];
+    }
+}
+
+
+void launch_v2(const float* a, float* b, int rows, int cols) {
+    dim3 block(kTileDim, kTileDim);
+    dim3 grid(div_up(cols, block.x), div_up(rows, block.y));
+    kernel_v2<<<grid, block>>>(a, b, rows, cols);
+
+}
 
 }  // namespace
 
@@ -77,8 +110,9 @@ int main() {
         void (*launch)(const float*, float*, int, int);
     };
 
-    const std::array<Version, 1> versions{{
+    const std::array<Version, 2> versions{{
         {"naive", launch_naive},
+        {"v2", launch_v2}
     }};
 
     for (const auto& version : versions) {

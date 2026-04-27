@@ -19,8 +19,9 @@
 
 ### Transpose（二维访存入门）
 1. naive：一个线程搬运一个元素，读连续、写跨 stride
+2. shared memory tiled transpose：用 shared memory 暂存 tile，交换 block 坐标后连续写回
 
-**当前瓶颈**：global memory 写入不连续，store coalescing 差
+**当前瓶颈**：仍是 memory-bound；global store 已改善，下一步分析 shared memory bank conflict
 
 ---
 
