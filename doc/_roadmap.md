@@ -39,21 +39,18 @@
 
 **后续参考**：不同 `kRowsPerBlock` 参数实验、cache / read-only path 观察、vectorized load / unroll。
 
+### Softmax（行归约 + 指数归一化）
+1. naive multi-pass：一个线程处理一行，分别求 max、求 exp sum、写归一化结果
+
+**当前瓶颈**：latency-bound + 行内串行；每行只有一个线程，`expf` 延迟和三次行扫描都没有被并行隐藏。
+
+**后续参考**：block-per-row softmax、online softmax、vectorized load/store、warp-level softmax。
+
 ---
 
 ## 🔜 下一步候选
 
 下面步骤是路线参考，不代表已经实现或已经实测；实际学习时仍然每轮只引入一个主要优化手段。
-
-### Softmax（行归约 + 指数归一化）
-学习价值：把 max reduce、sum reduce 和 elementwise 组合成一个常见深度学习算子。
-
-推荐步骤：
-1. naive multi-pass：每行分别求 max、求 exp sum、写归一化结果
-2. block-per-row softmax：一个 block 处理一行，在 shared memory / register 中做行内归约
-3. online softmax：单遍维护 running max 和 running sum，减少中间读写
-4. vectorized load/store：按连续列方向用 `float4` 读写，处理尾部边界
-5. warp-level softmax：短行场景下用 warp shuffle 减少 shared memory 和同步
 
 ### LayerNorm / RMSNorm（归一化层）
 学习价值：练习“reduce 统计量 + elementwise 写回”的融合，工程中高频。
