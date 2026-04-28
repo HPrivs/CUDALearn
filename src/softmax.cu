@@ -22,6 +22,7 @@ namespace {
 constexpr int kRows = 4096;
 constexpr int kCols = 4096;
 constexpr int kBlockSize = 256;
+constexpr int kWarpSize = 32;
 
 int div_up(int a, int b) {
     return (a + b - 1) / b;
@@ -83,16 +84,17 @@ __global__ void kernel_v2(const float* x, float* y, int rows, int cols) {
     if (row >= rows) {
         return;
     }
-
     extern __shared__ float smem[];
+
     int tid = threadIdx.x;
     const size_t row_offset = static_cast<size_t>(row) * cols;
 
-    float thread_max = -FLT_MAX;
+    float max_val = -FLT_MAX;
     for (int col = tid; col < cols; col += blockDim.x) {
-        thread_max = fmaxf(thread_max, x[row_offset + col]);
+        max_val = fmaxf(max_val, x[row_offset + col]);
     }
-    smem[tid] = thread_max;
+
+    smem[tid] = max_val;
     __syncthreads();
 
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -101,13 +103,13 @@ __global__ void kernel_v2(const float* x, float* y, int rows, int cols) {
         }
         __syncthreads();
     }
-    float max_val = smem[0];
+    max_val = smem[0];
 
-    float thread_sum = 0.0f;
+    float denom = 0.0f;
     for (int col = tid; col < cols; col += blockDim.x) {
-        thread_sum += expf(x[row_offset + col] - max_val);
+        denom += expf(x[row_offset + col] - max_val);
     }
-    smem[tid] = thread_sum;
+    smem[tid] = denom;
     __syncthreads();
 
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -116,17 +118,111 @@ __global__ void kernel_v2(const float* x, float* y, int rows, int cols) {
         }
         __syncthreads();
     }
-    float denom = smem[0];
+    denom = smem[0];
 
     for (int col = tid; col < cols; col += blockDim.x) {
         y[row_offset + col] = expf(x[row_offset + col] - max_val) / denom;
     }
 }
 
+
 void launch_v2(const float* x, float* y, int rows, int cols) {
     kernel_v2<<<rows, kBlockSize, kBlockSize * sizeof(float)>>>(x, y, rows, cols);
 }
 
+// ========= v3: warp shuffle block reduce =========
+// warp shuffle 解决的问题：warp 内归约不再反复读写 shared memory，减少部分同步和片上访存。
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+    }
+    return val;
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+__device__ __forceinline__ float block_reduce_max(float val) {
+    __shared__ float warp_vals[32];
+    const int tid = threadIdx.x;
+    const int lane = tid & (kWarpSize - 1);
+    const int warp_id = tid / kWarpSize;
+    const int num_warps = (blockDim.x + kWarpSize - 1) / kWarpSize;
+
+    val = warp_reduce_max(val);
+    if (lane == 0) {
+        warp_vals[warp_id] = val;
+    }
+    __syncthreads();
+
+    val = (tid < num_warps) ? warp_vals[lane] : -FLT_MAX;
+    if (warp_id == 0) {
+        val = warp_reduce_max(val);
+    }
+    if (tid == 0) {
+        warp_vals[0] = val;
+    }
+    __syncthreads();
+    return warp_vals[0];
+}
+
+__device__ __forceinline__ float block_reduce_sum(float val) {
+    __shared__ float warp_vals[32];
+    const int tid = threadIdx.x;
+    const int lane = tid & (kWarpSize - 1);
+    const int warp_id = tid / kWarpSize;
+    const int num_warps = (blockDim.x + kWarpSize - 1) / kWarpSize;
+
+    val = warp_reduce_sum(val);
+    if (lane == 0) {
+        warp_vals[warp_id] = val;
+    }
+    __syncthreads();
+
+    val = (tid < num_warps) ? warp_vals[lane] : 0.0f;
+    if (warp_id == 0) {
+        val = warp_reduce_sum(val);
+    }
+    if (tid == 0) {
+        warp_vals[0] = val;
+    }
+    __syncthreads();
+    return warp_vals[0];
+}
+
+__global__ void kernel_v3(const float* x, float* y, int rows, int cols) {
+    int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+    const size_t row_offset = static_cast<size_t>(row) * cols;
+
+    float thread_max = -FLT_MAX;
+    for (int col = tid; col < cols; col += blockDim.x) {
+        thread_max = fmaxf(thread_max, x[row_offset + col]);
+    }
+    float max_val = block_reduce_max(thread_max);
+
+    float thread_sum = 0.0f;
+    for (int col = tid; col < cols; col += blockDim.x) {
+        thread_sum += expf(x[row_offset + col] - max_val);
+    }
+    float denom = block_reduce_sum(thread_sum);
+
+    for (int col = tid; col < cols; col += blockDim.x) {
+        y[row_offset + col] = expf(x[row_offset + col] - max_val) / denom;
+    }
+}
+
+void launch_v3(const float* x, float* y, int rows, int cols) {
+    kernel_v3<<<rows, kBlockSize>>>(x, y, rows, cols);
+}
 
 }  // namespace
 
@@ -155,9 +251,10 @@ int main() {
         void (*launch)(const float*, float*, int, int);
     };
 
-    const std::array<Version, 2> versions{{
+    const std::array<Version, 3> versions{{
         {"naive", launch_naive},
         {"v2_block", launch_v2},
+        {"v3_warp", launch_v3},
     }};
 
     for (const auto& version : versions) {

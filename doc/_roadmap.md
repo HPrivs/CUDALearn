@@ -37,21 +37,22 @@
 
 **当前瓶颈**：memory-bound + block 粒度取舍；`x` 的实际 DRAM 复用还需要 profiler 验证。
 
-**后续参考**：不同 `kRowsPerBlock` 参数实验、cache / read-only path 观察、vectorized load / unroll。
+**后续参考**：不同 `kRowsPerBlock` 参数实验、vectorized load + unroll、cache / read-only path 观察，并用 profiler 判断是否真的受 global load 指令和 DRAM traffic 限制。
 
 ### Softmax（行归约 + 指数归一化）
 1. naive multi-pass：一个线程处理一行，分别求 max、求 exp sum、写归一化结果
 2. block-per-row shared memory reduce：一个 block 处理一行，用 shared memory 做 max 和 sum 归约
+3. warp shuffle block reduce：warp 内用 `__shfl_down_sync` 归约，减少 shared memory 读写和部分同步
 
-**当前瓶颈**：latency-bound + reduction overhead；行内串行已明显改善，但仍有三次行扫描、两次 block-level reduction 和重复 `expf`。
+**当前瓶颈**：latency-bound + expf/global-memory dominated；行内串行和部分 reduce 开销已改善，但仍有三次行扫描和重复 `expf`。
 
-**后续参考**：online softmax、vectorized load/store、warp-level softmax。
+**后续参考**：online softmax、vectorized load/store。下一步优先学 online softmax 这种算法级改写。
 
 ---
 
 ## 🔜 下一步候选
 
-下面步骤是路线参考，不代表已经实现或已经实测；实际学习时仍然每轮只引入一个主要优化手段。
+下面步骤是路线参考，不代表已经实现或已经实测；实际学习时仍然每轮只引入一个主要优化手段。后续算子可以把已经学过的优化手段作为 baseline 组合使用；每个步骤只标出本轮真正新增的核心概念。
 
 ### LayerNorm / RMSNorm（归一化层）
 学习价值：练习“reduce 统计量 + elementwise 写回”的融合，工程中高频。
@@ -59,9 +60,10 @@
 推荐步骤：
 1. naive multi-pass LayerNorm：分别求 mean、variance，再归一化写回
 2. block-per-row reduce：一个 block 处理一行，shared memory 归约 mean 和 variance
-3. Welford variance：用数值更稳定的在线方差统计替代简单平方和
-4. fused affine：把 `gamma/beta` 缩放平移融合到归一化 kernel
-5. RMSNorm：去掉 mean，只计算均方根，对比访存、FLOPs 和数值差异
+3. warp shuffle reduce：用 `__shfl_down_sync` 降低 shared memory 读写和部分同步
+4. Welford variance：用数值更稳定的在线方差统计替代简单平方和
+5. fused affine：把 `gamma/beta` 缩放平移融合到归一化 kernel
+6. RMSNorm：去掉 mean，只计算均方根，对比访存、FLOPs 和数值差异
 
 ### GEMM（矩阵乘法）
 学习价值：串联二维 tiling、shared memory 复用、register tile 和更高阶的矩阵乘优化。
@@ -70,10 +72,11 @@
 1. naive：一个线程计算一个 `C[row, col]`
 2. shared memory tile：把 `A/B` tile 搬到 shared memory，减少 global memory 重复读取
 3. register tile：一个线程计算多个输出元素，提高每次读入数据的复用
-4. vectorized global load：用连续向量化访存改善 global load/store 指令效率
-5. double buffering：计算当前 tile 时预取下一 tile，隐藏部分访存延迟
-6. `cp.async`（硬件支持时）：异步拷贝 global 到 shared memory，减少同步等待
-7. Tensor Core（硬件支持时）：用 WMMA / MMA 提高低精度矩阵乘吞吐
+4. tile 参数与 occupancy / register pressure 分析：解释 tile 过大为什么可能变慢
+5. vectorized global load：用连续向量化访存改善 global load/store 指令效率
+6. double buffering：计算当前 tile 时预取下一 tile，隐藏部分访存延迟
+7. `cp.async`（硬件支持时）：异步拷贝 global 到 shared memory，减少同步等待
+8. Tensor Core（硬件支持时）：用 WMMA / MMA 提高低精度矩阵乘吞吐
 
 ### Conv2d（二维卷积）
 学习价值：理解卷积如何转化或映射成矩阵乘，并观察数据复用与边界处理。

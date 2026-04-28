@@ -80,7 +80,7 @@ nvcc src/softmax.cu -o debugger/softmax && ./debugger/softmax
 
 | version | ms | GB/s | TFLOPS | max_err |
 | --- | ---: | ---: | ---: | ---: |
-| naive | 2.9928 | 89.69 | 0.0224 | 0.000000 |
+| naive | 2.9371 | 91.39 | 0.0228 | 0.000000 |
 
 本次 `max_err` 低于代码里的 `1e-5` correctness 阈值。`GB/s` 仍明显低于纯搬运类算子，说明 naive softmax 不是把 DRAM 带宽打满的形态；一个线程串行处理整行时，`expf` 延迟、循环串行和行内并行度不足更突出。
 
@@ -165,14 +165,14 @@ v1 每行只有 1 个线程，`K = 4096` 时这个线程要串行完成整行的
 nvcc src/softmax.cu -o debugger/softmax && ./debugger/softmax
 ```
 
-当前记录，默认 `M = 4096, K = 4096`，`timeit` 使用 `warmup=3, iters=20`。同一程序连续跑了三次，趋势一致；下表记录最终验证结果：
+当前记录，默认 `M = 4096, K = 4096`，`timeit` 使用 `warmup=3, iters=20`：
 
 | version | ms | GB/s | TFLOPS | max_err |
 | --- | ---: | ---: | ---: | ---: |
-| naive | 2.9928 | 89.69 | 0.0224 | 0.000000 |
-| v2_block | 0.6203 | 432.76 | 0.1082 | 0.000000 |
+| naive | 2.9371 | 91.39 | 0.0228 | 0.000000 |
+| v2_block | 0.6056 | 443.22 | 0.1108 | 0.000000 |
 
-相对当前机器上的 naive，v2 约快 `2.9928 / 0.6203 = 4.82x`。这符合预期：逻辑访存量没有变，但每行从单线程串行变成了 256 线程并行，行内工作长度明显下降。
+相对当前机器上的 naive，v2 约快 `2.9371 / 0.6056 = 4.85x`。这符合预期：逻辑访存量没有变，但每行从单线程串行变成了 256 线程并行，行内工作长度明显下降。
 
 ### 当前瓶颈
 v2 的主要瓶颈已经不是“每行只有一个线程”。剩下的问题集中在：
@@ -204,11 +204,108 @@ for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
 }
 ```
 
+## v3 — warp shuffle block reduce
+
+### 本版学习目标
+把 v2 的 shared memory tree reduce 改成 warp shuffle reduce。新增概念只有一个：用 `__shfl_down_sync` 在 warp 内直接交换寄存器值，减少 shared memory 读写和部分 block-level 同步。
+
+warp shuffle：同一个 warp 内的线程直接读取彼此的 register 值，不需要先写到 shared memory。
+
+### 改了什么
+v3 保留 v2 的整体映射：
+
+- 仍然是 `row = blockIdx.x`，一个 block 处理一行。
+- 仍然每个线程以 `col += blockDim.x` 分摊列。
+- 仍然三次扫描：求 `max`、求 `sum(exp)`、写回。
+
+真正变化在 block reduce：
+
+- 每个 warp 先用 `warp_reduce_max / warp_reduce_sum` 在 warp 内归约。
+- 每个 warp 只让 lane 0 把该 warp 的局部结果写入 shared memory。
+- 第一个 warp 再把这些 warp-level partial 归约成 block 级结果。
+- v3 launch 不再需要动态 shared memory 参数：`kernel_v3<<<rows, kBlockSize>>>(...)`。
+
+### 为什么可能更快
+v2 的每一轮 tree reduce 都要读写 shared memory，并在每个 stride 后 `__syncthreads()`。`kBlockSize = 256` 时，一次 reduce 有 8 个 stride；max 和 sum 两次 reduce 会产生多轮同步。
+
+v3 把 warp 内的 32 路归约放到 register shuffle 里完成。shared memory 只保存每个 warp 的 partial result，默认 256 线程只有 8 个 warp partial。理论上，v3 应该减少 shared memory load/store 指令和 barrier stall。
+
+但 v3 没有改变三次 global memory 扫描，也没有减少两次 `expf`。如果主要时间花在 global memory 和 `expf` 上，减少 reduce 开销只能带来小幅收益。
+
+### 代码要点
+- `warp_reduce_max` 和 `warp_reduce_sum` 使用 `__shfl_down_sync(0xffffffff, val, offset)`，每次把距离为 `offset` 的 lane 的值拿过来合并。
+- `block_reduce_max` 和 `block_reduce_sum` 先做 warp 内归约，再用 shared memory 合并 warp partial。
+- `warp_vals[32]` 最多容纳 32 个 warp 的 partial，覆盖 CUDA 单 block 最多 1024 线程的情况。
+- `tid < num_warps` 的线程负责读取 warp partial；其余线程用归约的单位元：max 用 `-FLT_MAX`，sum 用 `0.0f`。
+
+### 定量分析
+v3 的 global memory 逻辑访存和 v2 相同：每个输出元素读 `x` 三次、写 `y` 一次。
+
+| 量 | 表达式 | 说明 |
+| --- | --- | --- |
+| 访存字节 `B` | `M * K * 4 * 4` | 三次读 `x`，一次写 `y`；不含 shared memory |
+| FLOPs `F` | `M * K * 4` | 统计 2 次减法、1 次加法、1 次除法；不把比较、shuffle 和 `expf` 计入 FLOPs |
+| 算术强度 `AI` | `F / B = 0.25 FLOP/Byte` | global memory 口径下不变 |
+
+v3 改变的是片上归约开销。v2 的 shared memory tree reduce 对每个 block 做两次完整树形归约；v3 只把每个 warp 的 partial 写到 shared memory，再由第一个 warp 合并。这个改动主要应体现在 shared memory 指令数和 barrier stall 上，而不是 `dram__bytes_read/write` 上。
+
+瓶颈定性判定：**latency-bound + expf/global-memory dominated**。v3 减少了 reduce 的片上开销，但当前默认规模下 reduce 不是唯一主耗时；三次 global load 和两次 `expf` 仍然保留，所以实测只小幅快于 v2。
+
+可验证的 NCU metric 名：
+- `smsp__inst_executed_op_shared_ld`
+- `smsp__inst_executed_op_shared_st`
+- `smsp__warp_issue_stalled_barrier_per_warp_active`
+- `smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active`
+- `smsp__inst_executed_op_global_ld`
+- `smsp__inst_executed_op_global_st`
+- `dram__bytes_read`
+- `dram__bytes_write`
+
+这些 metric 名已在本轮用 `ncu --chips ga100 --query-metrics` 查询确认。当前只写入 benchmark 数据，没有写入 profiler 实测数据；如果后续验证，重点看 v3 相比 v2 的 shared load/store 和 barrier stall 是否下降。
+
+### 实测结果
+用下面命令重新编译并实测：
+
+```bash
+nvcc src/softmax.cu -o debugger/softmax && ./debugger/softmax
+```
+
+当前记录，默认 `M = 4096, K = 4096`，`timeit` 使用 `warmup=3, iters=20`。同一程序连续跑了三次，趋势有波动；下表记录最终验证结果：
+
+| version | ms | GB/s | TFLOPS | max_err |
+| --- | ---: | ---: | ---: | ---: |
+| naive | 2.9371 | 91.39 | 0.0228 | 0.000000 |
+| v2_block | 0.6056 | 443.22 | 0.1108 | 0.000000 |
+| v3_warp | 0.5818 | 461.41 | 0.1154 | 0.000000 |
+
+相对 v2，v3 约快 `0.6056 / 0.5818 = 1.04x`，也就是约 `4.1%`。这个收益小于 v1 到 v2 的变化，说明当前版本的主要瓶颈已经不只是 shared memory reduce；warp shuffle 降低了片上归约成本，但没有改变 global memory 扫描和 `expf` 重复计算。
+
+### 当前瓶颈
+v3 剩下的主要问题：
+
+- 仍然三次扫描 global memory。
+- sum 阶段和 write 阶段仍然各算一次 `expf`。
+- block 级结果仍需要跨 warp 合并，所以不能完全消除 shared memory 和 `__syncthreads()`。
+- 对 `K = 4096` 这种较长行，reduce 开销占比有限；对更短的行，v3 的收益可能更明显，也可能被 launch/block 开销淹没，需要实测。
+
+### 代价或限制
+v3 代码比 v2 更复杂，需要理解 warp、lane、warp_id 和 shuffle mask。当前使用 `0xffffffff` 作为 mask，前提是参与 shuffle 的 warp lane 都是 active；本 kernel 每个 block 固定启动完整 warp，满足这个前提。
+
+这个版本没有使用 online softmax，因此不能减少 pass 数，也不能减少第二次 `expf`。它只是优化了 block 内 reduce 的实现方式。
+
+### 下一步
+下一版更适合学习 online softmax：把 max 和 sum 的统计合并到一次流式更新里，为后续 attention / FlashAttention 的分块 softmax 做准备。是否真的减少总时间，要看减少 pass 数和增加数学操作之间的取舍。
+
+### v3 作业
+1. 解释为什么 v3 只比 v2 小幅更快：请从 global memory 扫描、`expf`、shared memory reduce 三个角度回答。
+2. 改错题：如果把 `block_reduce_sum` 里非 partial 线程的单位元写成 `-FLT_MAX`，会造成什么错误？为什么 max reduce 和 sum reduce 的单位元不同？
+
 ## 对比总表
 
 | version | 核心方法 | ms | GB/s | TFLOPS | max_err | 当前瓶颈 |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| naive | 一个线程处理一行，三次扫描 | 2.9928 | 89.69 | 0.0224 | 0.000000 | latency-bound + 行内串行 |
-| v2_block | 一个 block 处理一行，shared memory 做 max/sum reduce | 0.6203 | 432.76 | 0.1082 | 0.000000 | latency-bound + reduction overhead |
+| naive | 一个线程处理一行，三次扫描 | 2.9371 | 91.39 | 0.0228 | 0.000000 | latency-bound + 行内串行 |
+| v2_block | 一个 block 处理一行，shared memory 做 max/sum reduce | 0.6056 | 443.22 | 0.1108 | 0.000000 | latency-bound + reduction overhead |
+| v3_warp | 一个 block 处理一行，warp shuffle 做大部分 reduce | 0.5818 | 461.41 | 0.1154 | 0.000000 | latency-bound + expf/global-memory dominated |
 
 ## 参考资料

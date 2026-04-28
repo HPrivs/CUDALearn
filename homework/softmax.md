@@ -56,7 +56,7 @@ __global__ void kernel_naive(const float* x, float* y, int rows, int cols) {
 
 ### 自我检查
 
-指数范围更准确是(0, 1]。公共因子是exp(-m)此处是笔误。
+指数范围更准确是`(0, 1]`。公共因子是exp(-m)此处是笔误。
 
 ### 批改反馈
 
@@ -71,11 +71,23 @@ __global__ void kernel_naive(const float* x, float* y, int rows, int cols) {
 
 ### 我的答案
 
+v2版本的每行并行度从1提升到了kBlockSize=256，提升了每行并行度，在softmax这个需要大量串行工作的kernel下，大大降低了线程每行串行的工作量。
+v2的逻辑访存量不变，仍然是读3次x写1次y（M * K * 4）。片上访存增加了smem[kBlockSize]的多次访存，包括树形查找最大值和树形规约。
+v2的同步开销是增加了的，因为大部分写入smem[tid]情况都需要等待规约结束。
 
 ### 自我检查
 
+逻辑访存量漏了sizeof(flaot) = 4，所以逻辑访存量应该是`M * K *16`。
 
 ### 批改反馈
+
+基本正确。
+
+关键点都覆盖到了：v2 把每行从 1 个线程提升到一个 block 内 `kBlockSize = 256` 个线程，单个线程负责的列数大约从 `K` 降到 `K / 256`，这是主要加速来源；你也正确指出 v2 的 global memory 逻辑访存模式没有减少，仍然是三次读 `x`、一次写 `y`；同步和 shared memory 访问是 v2 新增代价。
+
+需要修正一个数字：逻辑访存量如果按字节算，应是 `M * K * 4 * sizeof(float) = M * K * 16 bytes`，不是 `M * K * 4`。这里的 `4` 是“3 次读 + 1 次写”的访问次数，乘上 `sizeof(float)` 后才是字节数。
+
+“大部分写入 `smem[tid]` 情况都需要等待规约结束”这句可以说得更精确：每次把局部结果写入 `smem[tid]` 后，需要一次同步保证所有线程都写完；reduce 每一轮之后也需要同步，保证下一轮读到的是上一轮已经合并好的结果。
 
 
 ### 题目 2
@@ -90,6 +102,41 @@ for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
     __syncthreads();
 }
 ```
+
+### 我的答案
+
+smem[tid] = thread_max;下方需要一次同步，不然可能会读取未完成写入的smem[tid]。
+
+### 自我检查
+
+
+### 批改反馈
+
+正确。缺少的就是：
+
+```cpp
+smem[tid] = thread_max;
+__syncthreads();
+```
+
+原因是所有线程必须先把自己的 `thread_max` 写入 `smem[tid]`，后续 reduce 才能安全读取 `smem[tid + stride]`。如果少了这次同步，部分线程可能还没写完，另一些线程已经开始读 shared memory，结果会读到旧值或未初始化值，导致 `max_val` 错误。`max_val` 一错，后面的 `denom` 和最终 softmax 输出都会错。
+
+## v3 作业
+
+### 题目 1
+解释为什么 v3 只比 v2 小幅更快：请从 global memory 扫描、`expf`、shared memory reduce 三个角度回答。
+
+### 我的答案
+
+
+### 自我检查
+
+
+### 批改反馈
+
+
+### 题目 2
+改错题：如果把 `block_reduce_sum` 里非 partial 线程的单位元写成 `-FLT_MAX`，会造成什么错误？为什么 max reduce 和 sum reduce 的单位元不同？
 
 ### 我的答案
 
