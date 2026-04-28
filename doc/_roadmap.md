@@ -41,10 +41,11 @@
 
 ### Softmax（行归约 + 指数归一化）
 1. naive multi-pass：一个线程处理一行，分别求 max、求 exp sum、写归一化结果
+2. block-per-row shared memory reduce：一个 block 处理一行，用 shared memory 做 max 和 sum 归约
 
-**当前瓶颈**：latency-bound + 行内串行；每行只有一个线程，`expf` 延迟和三次行扫描都没有被并行隐藏。
+**当前瓶颈**：latency-bound + reduction overhead；行内串行已明显改善，但仍有三次行扫描、两次 block-level reduction 和重复 `expf`。
 
-**后续参考**：block-per-row softmax、online softmax、vectorized load/store、warp-level softmax。
+**后续参考**：online softmax、vectorized load/store、warp-level softmax。
 
 ---
 

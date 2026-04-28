@@ -1,7 +1,7 @@
 // Softmax: y[row, col] = exp(x[row, col] - max(row)) / sum_j exp(x[row, j] - max(row))
 // I/O shape: x is M x K row-major, y is M x K row-major
 // dtype: float32
-// default problem size: M = 4096, K = 1024
+// default problem size: M = 4096, K = 4096
 // theoretical traffic per output element: read x 3 times + write y once = 16B
 // reported FLOPs per output element: 2 subtracts + 1 add + 1 divide = 4 FLOPs
 // note: comparisons and exp are not counted in reported FLOPs.
@@ -54,20 +54,19 @@ __global__ void kernel_naive(const float* x, float* y, int rows, int cols) {
     if (row >= rows) {
         return;
     }
-
+    
     const size_t row_offset = static_cast<size_t>(row) * cols;
-
     float max_val = -FLT_MAX;
-    for (int col = 0; col < cols; ++col) {
+    for (int col = 0; col < cols; col++) {
         max_val = fmaxf(max_val, x[row_offset + col]);
     }
 
     float denom = 0.0f;
-    for (int col = 0; col < cols; ++col) {
+    for (int col = 0; col < cols; col++) {
         denom += expf(x[row_offset + col] - max_val);
     }
 
-    for (int col = 0; col < cols; ++col) {
+    for (int col = 0; col < cols; col++) {
         y[row_offset + col] = expf(x[row_offset + col] - max_val) / denom;
     }
 }
@@ -76,6 +75,58 @@ void launch_naive(const float* x, float* y, int rows, int cols) {
     int grid = div_up(rows, kBlockSize);
     kernel_naive<<<grid, kBlockSize>>>(x, y, rows, cols);
 }
+
+// ========= v2: block-per-row shared memory reduce =========
+// block-per-row 解决的问题：让一个 block 内的多个线程并行处理同一行，减少行内串行等待。
+__global__ void kernel_v2(const float* x, float* y, int rows, int cols) {
+    int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    extern __shared__ float smem[];
+    int tid = threadIdx.x;
+    const size_t row_offset = static_cast<size_t>(row) * cols;
+
+    float thread_max = -FLT_MAX;
+    for (int col = tid; col < cols; col += blockDim.x) {
+        thread_max = fmaxf(thread_max, x[row_offset + col]);
+    }
+    smem[tid] = thread_max;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] = fmaxf(smem[tid], smem[tid + stride]);
+        }
+        __syncthreads();
+    }
+    float max_val = smem[0];
+
+    float thread_sum = 0.0f;
+    for (int col = tid; col < cols; col += blockDim.x) {
+        thread_sum += expf(x[row_offset + col] - max_val);
+    }
+    smem[tid] = thread_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+    float denom = smem[0];
+
+    for (int col = tid; col < cols; col += blockDim.x) {
+        y[row_offset + col] = expf(x[row_offset + col] - max_val) / denom;
+    }
+}
+
+void launch_v2(const float* x, float* y, int rows, int cols) {
+    kernel_v2<<<rows, kBlockSize, kBlockSize * sizeof(float)>>>(x, y, rows, cols);
+}
+
 
 }  // namespace
 
@@ -104,8 +155,9 @@ int main() {
         void (*launch)(const float*, float*, int, int);
     };
 
-    const std::array<Version, 1> versions{{
+    const std::array<Version, 2> versions{{
         {"naive", launch_naive},
+        {"v2_block", launch_v2},
     }};
 
     for (const auto& version : versions) {
