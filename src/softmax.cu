@@ -20,7 +20,7 @@
 namespace {
 
 constexpr int kRows = 4096;
-constexpr int kCols = 1024;
+constexpr int kCols = 4096;
 constexpr int kBlockSize = 256;
 
 int div_up(int a, int b) {
