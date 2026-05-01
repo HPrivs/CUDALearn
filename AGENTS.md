@@ -45,6 +45,7 @@ Build 规则：
 - 项目首次若缺 `src/common.cuh` 或 `doc/_roadmap.md`，先创建；若缺 `homework/`，先创建。
 - 一轮默认只引入一个主要优化手段；若用户要求多个手段，拆成多个版本或说明耦合原因。
 - 已经学过且本轮不是重点的优化手段可以合并使用，以提高学习效率；但必须在文档中区分“本轮新增概念”和“复用旧技巧”，并用 benchmark 说明合并后的净效果。
+- 开始新算子或选择下一轮优化前，先检查与已学算子的重复度；若主要手段已在前面充分学习过，优先压缩为 baseline 组合，不单独展开完整学习轮次，除非本轮目标是验证该手段在新问题形态下的适用边界。
 - 能编译运行就编译运行；缺 `nvcc`、GPU 或权限时，写明未验证原因，禁止伪造实测结果。
 - 新手法首次出现时，在代码或文档中用 1 句中文解释“它解决了什么问题”。
 - 首次学习算子 `X`：创建 `src/X.cu`（仅 `naive + main`）、`doc/X.md`、`homework/X.md`，并更新 `doc/_roadmap.md`。
@@ -71,6 +72,7 @@ Build 规则：
 - 候选列表按学习依赖排序，不按炫技程度排序。
 - 主线优先遵循经典 CUDA 优化路径：正确性基线 -> global memory 访问模式 -> block/thread 粒度 -> shared memory tiling/reduction -> per-thread register accumulation -> warp-level primitive -> 参数/occupancy/register pressure 分析 -> fusion/online 算法改写 -> 硬件特性。
 - 当多个优化手段已经在前面算子中学过，可以在后续算子中作为 baseline 组合使用；路线图仍只把真正的新概念列为本轮学习重点。
+- 每次推进路线时要评估“学习增量 / 重复度”：重复 shared memory reduce、warp shuffle、vectorized load 等旧技巧时，只保留它们对当前算子瓶颈的定量验证；文档重点转向 variance、fusion、tiling、online algorithm 等新问题。
 - `warp-level` 优化通常放在算法级改写前；例如 Softmax 先学 warp reduce，再学 online softmax。
 - GEMM 主线应覆盖 shared memory tile、register tile、tile 参数与 occupancy/register pressure、vectorized load、double buffering、`cp.async`、Tensor Core。
 - 硬件专属特性必须标注前提，禁止默认使用 `sm_90` 独占特性，例如 `TMA / wgmma / DSMEM / thread block cluster`。

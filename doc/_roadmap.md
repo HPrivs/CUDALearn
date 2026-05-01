@@ -49,22 +49,18 @@
 
 **后续参考**：vectorized load/store，或进入 Attention，把 online softmax 用到分块 `QK^T` 上。
 
+### LayerNorm / RMSNorm（归一化层）
+1. naive multi-pass LayerNorm：一个线程处理一行，分别求 mean、variance，再归一化写回
+
+**当前瓶颈**：latency-bound + low row-level parallelism + uncoalesced global access；有效 GB/s 很低，说明 naive 版没有打满 DRAM 带宽。
+
+**后续参考**：下一步把已学过的 block-per-row、shared memory 和 `__shfl_down_sync` 合并成 optimized baseline；后续重点放在 Welford variance、fused affine 和 RMSNorm。
+
 ---
 
 ## 🔜 下一步候选
 
 下面步骤是路线参考，不代表已经实现或已经实测；实际学习时仍然每轮只引入一个主要优化手段。后续算子可以把已经学过的优化手段作为 baseline 组合使用；每个步骤只标出本轮真正新增的核心概念。
-
-### LayerNorm / RMSNorm（归一化层）
-学习价值：练习“reduce 统计量 + elementwise 写回”的融合，工程中高频。
-
-推荐步骤：
-1. naive multi-pass LayerNorm：分别求 mean、variance，再归一化写回
-2. block-per-row reduce：一个 block 处理一行，shared memory 归约 mean 和 variance
-3. warp shuffle reduce：用 `__shfl_down_sync` 降低 shared memory 读写和部分同步
-4. Welford variance：用数值更稳定的在线方差统计替代简单平方和
-5. fused affine：把 `gamma/beta` 缩放平移融合到归一化 kernel
-6. RMSNorm：去掉 mean，只计算均方根，对比访存、FLOPs 和数值差异
 
 ### GEMM（矩阵乘法）
 学习价值：串联二维 tiling、shared memory 复用、register tile 和更高阶的矩阵乘优化。
