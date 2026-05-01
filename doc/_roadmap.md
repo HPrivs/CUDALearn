@@ -43,10 +43,11 @@
 1. naive multi-pass：一个线程处理一行，分别求 max、求 exp sum、写归一化结果
 2. block-per-row shared memory reduce：一个 block 处理一行，用 shared memory 做 max 和 sum 归约
 3. warp shuffle block reduce：warp 内用 `__shfl_down_sync` 归约，减少 shared memory 读写和部分同步
+4. online softmax：把 max 和 sum 的统计合并到一次扫描，减少一次 global memory 读取
 
-**当前瓶颈**：latency-bound + expf/global-memory dominated；行内串行和部分 reduce 开销已改善，但仍有三次行扫描和重复 `expf`。
+**当前瓶颈**：latency-bound + online rescale/reduce overhead；global memory 扫描已从三次降到两次，但写回阶段仍要再次读取 `x` 并计算 `expf`。
 
-**后续参考**：online softmax、vectorized load/store。下一步优先学 online softmax 这种算法级改写。
+**后续参考**：vectorized load/store，或进入 Attention，把 online softmax 用到分块 `QK^T` 上。
 
 ---
 

@@ -128,11 +128,21 @@ __syncthreads();
 
 ### 我的答案
 
+global memory 扫描仍然是三次，比起v2，DRAM的访存并没有改变；
+`expf`仍然要进行两次`expf(x[row_offset + col] - max_val)`；
+v3更快的地方在shared memory reduce，引入了warp shuffle，减少了block-level同步开销和shared memory的访存开销。
+
 
 ### 自我检查
 
 
 ### 批改反馈
+
+正确。
+
+你抓住了 v3 只小幅快于 v2 的核心原因：v3 优化的是 block 内 reduce 的实现方式，而不是 softmax 的主要外层工作量。global memory 仍然是三次扫描 `x`、一次写 `y`，所以有效 DRAM 访存量没有下降；`expf` 仍然在 sum 阶段和 write 阶段各算一次，也没有减少 special function 的计算压力。
+
+更精确地说，v3 的收益来自把 v2 中 warp 内的 shared memory tree reduce 换成 register-level `__shfl_down_sync`，因此减少 shared memory load/store 和部分 `__syncthreads()` 带来的 barrier 开销。但默认 `K = 4096` 时，每行还有大量 global load 和两轮 `expf`，reduce 开销只占总时间的一部分，所以 benchmark 里只看到约 `1.04x` 的小幅提升是合理的。
 
 
 ### 题目 2
@@ -140,8 +150,95 @@ __syncthreads();
 
 ### 我的答案
 
+`block_reduce_max`里非partial线程的单位元使用`-FLT_MAX`是为了防止非partial线程干扰比较结果。在`block_reduce_sum`使用`-FLT_MAX`单位元会导致规约时partial线程的val加上干扰值`-FLT_MAX`导致结果错误；
+单位元不同是因为`-FLT_MAX`是用于比较的；`0.0f`是用于求和的。
 
 ### 自我检查
 
 
 ### 批改反馈
+
+正确。
+
+`block_reduce_sum` 里只有 `tid < num_warps` 的线程持有真实的 warp partial sum，其余线程只是为了凑满第一个 warp 的归约形状，必须放入“不会改变求和结果”的单位元，也就是 `0.0f`。如果这些线程写成 `-FLT_MAX`，sum reduce 会把这些巨大负数加进 `denom`，轻则得到错误的负数或极端值，重则后续 `exp(...) / denom` 产生完全错误的 softmax 输出。
+
+max reduce 和 sum reduce 的单位元由运算本身决定：`max(x, -FLT_MAX) = x`，所以 `-FLT_MAX` 适合 max；`x + 0 = x`，所以 `0.0f` 适合 sum。这里不能因为两个函数结构相似就复用同一个单位元。
+
+## v4 作业
+
+### 题目 1
+概念题：给定旧状态 `(m_old, d_old)` 和新元素 `x`，分别写出 `x <= m_old` 与 `x > m_old` 两种情况下 online softmax 的更新公式，并解释为什么最大值变大时旧的 `d_old` 必须乘 `exp(m_old - x)`。
+
+### 我的答案
+伪代码：
+``` cpp
+if (x > m_old) {
+    m_new = x;
+    d_new = d_old * exp(m_old - x) + 1.0f;
+}
+else {
+    d_new = d_old + exp(x - m_old); 
+}
+```
+
+乘`exp(m_old - x)`首先是为了将分母各项的指数还原回未减去`m_old`的状态再减去新最大值`x`。
+
+### 自我检查
+
+解释上，这里的缩放用还原不太合适，应该说把旧分母从`m_old`基准转换到新最大值`x`的基准。
+
+### 批改反馈
+
+基本正确。
+
+公式部分只差一个小补全：当 `x <= m_old` 时，最大值不变，所以应明确写成 `m_new = m_old`，`d_new = d_old + exp(x - m_old)`。当 `x > m_old` 时，你写的 `m_new = x`，`d_new = d_old * exp(m_old - x) + 1.0f` 是对的。
+
+解释也抓住了核心。更精确地说，旧的 `d_old` 定义在旧最大值基准上：
+
+```text
+d_old = sum_i exp(x_i - m_old)
+```
+
+当新最大值变成 `x` 后，旧元素必须改成新基准：
+
+```text
+sum_i exp(x_i - x)
+= sum_i exp(x_i - m_old) * exp(m_old - x)
+= d_old * exp(m_old - x)
+```
+
+最后再加上新元素自己的贡献 `exp(x - x) = 1`。这个缩放不是为了“还原回未减去 `m_old` 的状态”本身，而是为了把旧分母从 `m_old` 基准转换到新最大值 `x` 基准。
+
+### 题目 2
+改错题：如果合并两个 partial state 时直接写 `d = d_a + d_b`，但 `m_a != m_b`，会造成什么错误？写出正确的合并公式。
+
+### 我的答案
+
+会导致分母中`d_a`或`d_b`其中一方的指数减去的并非最大值，造成数值错误。
+正确的合并公式：
+`m_a > m_b:`
+`d = d_a + d_b * exp(m_b - m_a)`
+`m_b >= m_a:`
+`d = d_a * exp(m_a - m_b) + d_b`
+
+### 自我检查
+
+
+### 批改反馈
+
+正确。
+
+问题本质是 `d_a` 和 `d_b` 不是同一个尺度下的分母：`d_a` 是按 `m_a` 归一化得到的，`d_b` 是按 `m_b` 归一化得到的。若 `m_a != m_b`，直接 `d_a + d_b` 等于把两个不同 max 基准下的指数和硬加在一起，分母会偏大或偏小，最终 softmax 概率整体错误。
+
+你的分支公式是对的：
+
+```text
+if m_a > m_b:
+    m = m_a
+    d = d_a + d_b * exp(m_b - m_a)
+else:
+    m = m_b
+    d = d_a * exp(m_a - m_b) + d_b
+```
+
+也可以写成统一形式：`m = max(m_a, m_b)`，`d = d_a * exp(m_a - m) + d_b * exp(m_b - m)`。这个统一写法更不容易漏掉某一侧的缩放。
