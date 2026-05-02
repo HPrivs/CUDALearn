@@ -52,10 +52,11 @@
 ### LayerNorm / RMSNorm（归一化层）
 1. naive multi-pass LayerNorm：一个线程处理一行，分别求 mean、variance，再归一化写回
 2. optimized baseline：一个 block 处理一行，复用 warp shuffle + shared memory 做行内归约
+3. Welford variance：一次统计扫描同时得到 mean 和 variance，减少一次读取 `x`
 
-**当前瓶颈**：memory-bound + block reduction / synchronization overhead；v2 已改善行内并行度和 warp 内访问连续性，但仍要三次读取 `x`。
+**当前瓶颈**：memory-bound + Welford arithmetic/reduction overhead；v3 已把统计阶段从两次读取 `x` 降到一次，但当前默认规模下额外算术和 combine 开销基本抵消了访存收益。
 
-**后续参考**：后续重点放在 Welford variance、fused affine 和 RMSNorm。
+**后续参考**：后续重点放在 fused affine 和 RMSNorm。
 
 ---
 

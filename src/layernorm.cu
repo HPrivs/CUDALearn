@@ -4,8 +4,11 @@
 // I/O shape: x is M x K row-major, y is M x K row-major
 // dtype: float32
 // default problem size: M = 4096, K = 4096
-// theoretical traffic per output element: read x 3 times + write y once = 16B
-// reported FLOPs per output element: 6 FLOPs; sqrt/div and row-level scale ops are not counted.
+// theoretical traffic per output element:
+//   v1/v2: read x 3 times + write y once = 16B
+//   v3: read x 2 times + write y once = 12B
+// reported FLOPs per output element:
+//   v1/v2: 6 FLOPs; v3: 7 FLOPs. sqrt/div and row-level scale ops are not counted.
 
 #include "common.cuh"
 
@@ -103,10 +106,11 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 
 __device__ __forceinline__ float block_reduce_sum(float val) {
     __shared__ float warp_vals[32];
-    const int tid = threadIdx.x;
-    const int lane = tid & (kWarpSize - 1);
-    const int warp_id = tid / kWarpSize;
-    const int num_warps = (blockDim.x + kWarpSize - 1) / kWarpSize;
+
+    int tid = threadIdx.x;
+    int lane = tid & (kWarpSize - 1);
+    int warp_id = tid / kWarpSize;
+    int num_warps = blockDim.x / kWarpSize;
 
     val = warp_reduce_sum(val);
     if (lane == 0) {
@@ -125,15 +129,16 @@ __device__ __forceinline__ float block_reduce_sum(float val) {
     return warp_vals[0];
 }
 
+
 __global__ void kernel_v2(const float* x, float* y, int rows, int cols) {
-    const int row = blockIdx.x;
+    int row = blockIdx.x;
     if (row >= rows) {
         return;
     }
 
-    const int tid = threadIdx.x;
-    const size_t row_offset = static_cast<size_t>(row) * cols;
+    int tid = threadIdx.x;
 
+    const size_t row_offset = static_cast<size_t>(row) * cols;
     float thread_sum = 0.0f;
     for (int col = tid; col < cols; col += blockDim.x) {
         thread_sum += x[row_offset + col];
@@ -159,6 +164,111 @@ void launch_v2(const float* x, float* y, int rows, int cols) {
     kernel_v2<<<rows, kBlockSize>>>(x, y, rows, cols);
 }
 
+// ========= v3: Welford variance =========
+// Welford 解决的问题：在一次扫描中稳定地合并 mean 和 variance 统计量，减少一次 global read。
+struct WelfordData {
+    float mean;
+    float m2;
+    int count;
+};
+
+__device__ __forceinline__ WelfordData make_welford_data() {
+    return {0.0f, 0.0f, 0};
+}
+
+__device__ __forceinline__ WelfordData welford_update(WelfordData acc, float x) {
+    acc.count += 1;
+    const float delta = x - acc.mean;
+    acc.mean += delta / static_cast<float>(acc.count);
+    const float delta2 = x - acc.mean;
+    acc.m2 += delta * delta2;
+    return acc;
+}
+
+__device__ __forceinline__ WelfordData welford_combine(WelfordData a, WelfordData b) {
+    if (a.count == 0) {
+        return b;
+    }
+    if (b.count == 0) {
+        return a;
+    }
+
+    const int count = a.count + b.count;
+    const float count_f = static_cast<float>(count);
+    const float a_count = static_cast<float>(a.count);
+    const float b_count = static_cast<float>(b.count);
+    const float delta = b.mean - a.mean;
+
+    WelfordData out;
+    out.count = count;
+    out.mean = a.mean + delta * (b_count / count_f);
+    out.m2 = a.m2 + b.m2 + delta * delta * (a_count * b_count / count_f);
+    return out;
+}
+
+__device__ __forceinline__ WelfordData warp_reduce_welford(WelfordData val) {
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        WelfordData other;
+        other.mean = __shfl_down_sync(0xffffffff, val.mean, offset);
+        other.m2 = __shfl_down_sync(0xffffffff, val.m2, offset);
+        other.count = __shfl_down_sync(0xffffffff, val.count, offset);
+        val = welford_combine(val, other);
+    }
+    return val;
+}
+
+__device__ __forceinline__ WelfordData block_reduce_welford(WelfordData val) {
+    __shared__ WelfordData warp_vals[32];
+
+    const int tid = threadIdx.x;
+    const int lane = tid & (kWarpSize - 1);
+    const int warp_id = tid / kWarpSize;
+    const int num_warps = blockDim.x / kWarpSize;
+
+    val = warp_reduce_welford(val);
+    if (lane == 0) {
+        warp_vals[warp_id] = val;
+    }
+    __syncthreads();
+
+    val = (tid < num_warps) ? warp_vals[lane] : make_welford_data();
+    if (warp_id == 0) {
+        val = warp_reduce_welford(val);
+    }
+    if (tid == 0) {
+        warp_vals[0] = val;
+    }
+    __syncthreads();
+    return warp_vals[0];
+}
+
+__global__ void kernel_v3(const float* x, float* y, int rows, int cols) {
+    const int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    const int tid = threadIdx.x;
+    const size_t row_offset = static_cast<size_t>(row) * cols;
+
+    WelfordData thread_stat = make_welford_data();
+    for (int col = tid; col < cols; col += blockDim.x) {
+        thread_stat = welford_update(thread_stat, x[row_offset + col]);
+    }
+    const WelfordData row_stat = block_reduce_welford(thread_stat);
+    const float mean = row_stat.mean;
+    const float var = row_stat.m2 / static_cast<float>(cols);
+    const float inv_std = 1.0f / sqrtf(var + kEps);
+
+    for (int col = tid; col < cols; col += blockDim.x) {
+        y[row_offset + col] = (x[row_offset + col] - mean) * inv_std;
+    }
+}
+
+void launch_v3(const float* x, float* y, int rows, int cols) {
+    kernel_v3<<<rows, kBlockSize>>>(x, y, rows, cols);
+}
+
 }  // namespace
 
 int main() {
@@ -166,8 +276,10 @@ int main() {
     const int cols = kCols;
     const size_t elems = static_cast<size_t>(rows) * cols;
     const size_t bytes = elems * sizeof(float);
-    const size_t traffic_bytes = elems * sizeof(float) * 4;
-    const size_t flops = elems * 6;
+    const size_t traffic_bytes_v12 = elems * sizeof(float) * 4;
+    const size_t traffic_bytes_v3 = elems * sizeof(float) * 3;
+    const size_t flops_v12 = elems * 6;
+    const size_t flops_v3 = elems * 7;
 
     float *d_x = nullptr, *d_y = nullptr;
     CUDA_CHECK(cudaMalloc(&d_x, bytes));
@@ -188,9 +300,10 @@ int main() {
         size_t flops;
     };
 
-    const std::array<Version, 2> versions{{
-        {"naive", launch_naive, traffic_bytes, flops},
-        {"v2_block_warp", launch_v2, traffic_bytes, flops},
+    const std::array<Version, 3> versions{{
+        {"naive", launch_naive, traffic_bytes_v12, flops_v12},
+        {"v2_block_warp", launch_v2, traffic_bytes_v12, flops_v12},
+        {"v3_welford", launch_v3, traffic_bytes_v3, flops_v3},
     }};
 
     for (const auto& version : versions) {
