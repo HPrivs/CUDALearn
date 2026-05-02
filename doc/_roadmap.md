@@ -51,10 +51,11 @@
 
 ### LayerNorm / RMSNorm（归一化层）
 1. naive multi-pass LayerNorm：一个线程处理一行，分别求 mean、variance，再归一化写回
+2. optimized baseline：一个 block 处理一行，复用 warp shuffle + shared memory 做行内归约
 
-**当前瓶颈**：latency-bound + low row-level parallelism + uncoalesced global access；有效 GB/s 很低，说明 naive 版没有打满 DRAM 带宽。
+**当前瓶颈**：memory-bound + block reduction / synchronization overhead；v2 已改善行内并行度和 warp 内访问连续性，但仍要三次读取 `x`。
 
-**后续参考**：下一步把已学过的 block-per-row、shared memory 和 `__shfl_down_sync` 合并成 optimized baseline；后续重点放在 Welford variance、fused affine 和 RMSNorm。
+**后续参考**：后续重点放在 Welford variance、fused affine 和 RMSNorm。
 
 ---
 
