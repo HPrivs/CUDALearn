@@ -143,12 +143,18 @@ v3 的逻辑访存字节比 v2 少 25%，为什么实测耗时却几乎不变？
 
 ### 我的答案
 
+通过引入welford arithmetic，DRAM读从三次`12B`变为两次`8B`，总逻辑访存减少了25%；但是welford维护的`mean`和`m2`每次访问一个元素都要进行更新，且block reduce时需要combine不同线程的`mean`和`m2`，这其中额外的算术开销与节省逻辑访存字节所带来的性能提升相抵了。
 
 ### 自我检查
 
 
 ### 批改反馈
 
+基本正确。你抓住了这题的核心：v3 的收益来自少一次 global read，但 Welford 的逐元素更新和跨线程合并引入额外计算，因此当前实测耗时和 v2 基本持平。
+
+需要修正一个口径：不是“DRAM 读从三次 `12B` 变为两次 `8B`”，而是按每个输出元素统计，v2 是三次读 `x` 加一次写 `y`，总有效字节 `16B`；v3 是两次读 `x` 加一次写 `y`，总有效字节 `12B`。所以减少的是总逻辑访存字节的 25%，不是只看读字节时的 25%。
+
+三个角度可以这样组织：第一，v3 少读一次 `x`，理论上降低 DRAM traffic；第二，`welford_update` 每个元素要更新 `count/mean/m2`，包含额外减法、除法、乘加，算术成本高于 v2 的简单 `sum` 或 `diff * diff`；第三，`block_reduce_welford` combine 的对象是 `{mean, m2, count}`，shuffle 和合并逻辑比 reduce 一个 `float sum` 更重。当前结果说明这三类额外成本基本抵消了少读一次 `x` 的收益。
 
 ### 题目 2
 下面的 Welford partial 合并方式有什么问题？为什么不能这样合并两个 partial statistics？
@@ -165,8 +171,20 @@ WelfordData wrong_combine(WelfordData a, WelfordData b) {
 
 ### 我的答案
 
+welford partial合并是利用新旧均值之间的关系更新均值和方差累积量，不是单纯的`mean`或`m2`的简单相加，合并的公式是：
+```cpp
+
+out.mean = a.mean + delta * (b.count / out.count);
+out.m2 = a.m2 + b.m2 + delta * delta * (a.count * b.count / out.count)
+
+```
 
 ### 自我检查
 
 
 ### 批改反馈
+
+正确，关键问题说到了：两个 partial statistics 的 `mean` 和 `m2` 不能直接相加，合并必须考虑两个分组的样本数和均值差。
+
+更精确地说，`out.mean = a.mean + b.mean` 会把均值放大，除非有非常特殊的数值刚好抵消；正确的 mean 是加权平均：`a.mean + delta * (b.count / out.count)`，其中 `delta = b.mean - a.mean`。`m2` 也不能只写 `a.m2 + b.m2`，因为两个 partial 的 `m2` 只统计了各自组内围绕各自 mean 的平方偏差；合并后整体 mean 变了，还必须补上两个组均值差带来的 correction term：`delta * delta * (a.count * b.count / out.count)`。
+
