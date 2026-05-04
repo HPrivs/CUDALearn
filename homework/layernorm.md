@@ -188,3 +188,76 @@ out.m2 = a.m2 + b.m2 + delta * delta * (a.count * b.count / out.count)
 
 更精确地说，`out.mean = a.mean + b.mean` 会把均值放大，除非有非常特殊的数值刚好抵消；正确的 mean 是加权平均：`a.mean + delta * (b.count / out.count)`，其中 `delta = b.mean - a.mean`。`m2` 也不能只写 `a.m2 + b.m2`，因为两个 partial 的 `m2` 只统计了各自组内围绕各自 mean 的平方偏差；合并后整体 mean 变了，还必须补上两个组均值差带来的 correction term：`delta * delta * (a.count * b.count / out.count)`。
 
+## v4 作业
+
+### 题目 1
+v4 和 v3 都是两次读 `x`、一次写 `y`，为什么 v4 仍可能略快？请从统计量、归约对象和“算子语义不同”三个角度回答。
+
+### 我的答案
+
+从统计量看，v4只需要统计行的均方，v3需要统计行的均值和m2，在统计的过程中需要不断更新，相比较v4的计算量更少。
+从规约对象看，v4的规约只需要求和即可，v3在规约的过程中需要combine对比welford结构更新均值和方差累积量，相较计算量也更少。
+从算子语义上看，Layernorm需要把行的均值归0，方差归为1；RMSNorm只需要统计行的均方，对行做均方根归一化。 
+
+
+### 自我检查
+
+
+### 批改反馈
+
+正确。
+
+关键要点：
+- 统计量角度说对了：v3 LayerNorm 要维护 `mean` 和 `m2`，v4 RMSNorm 只需要统计 `sum(x^2)`。
+- 归约对象角度说对了：v4 归约单个 `float`，v3 要合并 `{mean, m2, count}`，Welford combine 的 shuffle 和算术都更重。
+- 算子语义角度也说对了：RMSNorm 不是“优化后的 LayerNorm”，它不做 mean centering，所以只能和 LayerNorm 比较实现开销，不能说数学上等价替换。
+
+标准思路：v3 和 v4 的有效访存都是两次读 `x`、一次写 `y`，所以 v4 略快主要不是因为少读写，而是统计阶段更轻。v4 每个元素只做平方和累加，block 内也只 reduce 一个 sum；v3 每个元素要做 Welford update，block 内还要 combine 多字段统计量。
+
+### 题目 2
+下面这段 RMSNorm 代码至少有两个问题，请指出并说明后果。
+
+```cpp
+float thread_sq_sum = 0.0f;
+for (int col = tid; col < cols; col += blockDim.x) {
+    thread_sq_sum += x[row_offset + col];
+}
+
+const float sq_sum = block_reduce_sum(thread_sq_sum);
+const float inv_rms = 1.0f / sqrtf(sq_sum + kEps);
+
+for (int col = tid; col < cols; col += blockDim.x) {
+    y[row_offset + col] = (x[row_offset + col] - mean) * inv_rms;
+}
+```
+
+### 我的答案
+thread_sq_sum的统计有问题，统计对象应是行的均方和而不是行的和。
+```cpp
+    const float val = x[row_offset + col];
+    thread_sq_sum += val * val;
+```
+
+```cpp
+    // 错误：
+    y[row_offset + col] = (x[row_offset + col] - mean) * inv_rms;
+    // 应为：
+    y[row_offset + col] = x[row_offset + col] * inv_rms;
+```
+这样是对行减去平均值再均方根归一化，数学意义改变了，同时代码并没有统计平均值。
+
+### 自我检查
+
+漏了对行的平和方求均值，得到均方：
+`mean_square = sq_sum / cols`;
+
+### 批改反馈
+
+基本正确，两个主要问题都抓到了；还漏了一个尺度问题。
+
+关键要点：
+- `thread_sq_sum += x[...]` 是错的，RMSNorm 需要累加平方和，应该是 `val * val`。
+- 写回阶段不能写 `(x - mean) * inv_rms`。RMSNorm 不计算也不减去 `mean`，正确写法是 `x * inv_rms`。
+- 还需要补充：`inv_rms` 不能直接用 `sqrtf(sq_sum + kEps)`，应该先算 `mean_square = sq_sum / cols`，再用 `1.0f / sqrtf(mean_square + kEps)`。否则归一化尺度会随着 `cols` 变大而错误缩小。
+
+标准思路：RMSNorm 的统计量是每行 `mean(x^2)`，不是 `mean(x)`，也不是未除以 `cols` 的 `sum(x^2)`。最终输出保留输入的均值方向，只按 RMS 尺度缩放，因此公式是 `y = x / sqrt(mean_square + eps)`。

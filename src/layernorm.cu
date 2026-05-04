@@ -1,14 +1,17 @@
 // LayerNorm: y[row, col] = (x[row, col] - mean(row)) / sqrt(var(row) + eps)
 // mean(row) = sum_j x[row, j] / K
 // var(row) = sum_j (x[row, j] - mean(row))^2 / K
+// RMSNorm: y[row, col] = x[row, col] / sqrt(mean_square(row) + eps)
+// mean_square(row) = sum_j x[row, j]^2 / K
 // I/O shape: x is M x K row-major, y is M x K row-major
 // dtype: float32
 // default problem size: M = 4096, K = 4096
 // theoretical traffic per output element:
 //   v1/v2: read x 3 times + write y once = 16B
-//   v3: read x 2 times + write y once = 12B
+//   v3/v4: read x 2 times + write y once = 12B
 // reported FLOPs per output element:
-//   v1/v2: 6 FLOPs; v3: 7 FLOPs. sqrt/div and row-level scale ops are not counted.
+//   v1/v2: 6 FLOPs; v3: 7 FLOPs; v4: 3 FLOPs.
+//   sqrt/div and row-level scale ops are not counted.
 
 #include "common.cuh"
 
@@ -54,6 +57,26 @@ void cpu_ref(const std::vector<float>& x, std::vector<float>& y, int rows, int c
         for (int col = 0; col < cols; col++) {
             y[row_offset + col] =
                 static_cast<float>((static_cast<double>(x[row_offset + col]) - mean) * inv_std);
+        }
+    }
+}
+
+void cpu_ref_rmsnorm(const std::vector<float>& x, std::vector<float>& y, int rows, int cols) {
+    for (int row = 0; row < rows; row++) {
+        const size_t row_offset = static_cast<size_t>(row) * cols;
+
+        double sq_sum = 0.0;
+        for (int col = 0; col < cols; col++) {
+            const double val = static_cast<double>(x[row_offset + col]);
+            sq_sum += val * val;
+        }
+
+        const double mean_square = sq_sum / static_cast<double>(cols);
+        const double inv_rms = 1.0 / std::sqrt(mean_square + static_cast<double>(kEps));
+
+        for (int col = 0; col < cols; col++) {
+            y[row_offset + col] =
+                static_cast<float>(static_cast<double>(x[row_offset + col]) * inv_rms);
         }
     }
 }
@@ -269,6 +292,37 @@ void launch_v3(const float* x, float* y, int rows, int cols) {
     kernel_v3<<<rows, kBlockSize>>>(x, y, rows, cols);
 }
 
+// ========= v4: RMSNorm =========
+// RMSNorm 解决的问题：去掉 mean 统计，只用均方根归一化，降低统计阶段和归约对象复杂度。
+__global__ void kernel_v4(const float* x, float* y, int rows, int cols) {
+    const int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    const int tid = threadIdx.x;
+    const size_t row_offset = static_cast<size_t>(row) * cols;
+
+    float thread_sq_sum = 0.0f;
+    for (int col = tid; col < cols; col += blockDim.x) {
+        const float val = x[row_offset + col];
+        thread_sq_sum += val * val;
+    }
+
+    const float sq_sum = block_reduce_sum(thread_sq_sum);
+    const float mean_square = sq_sum / static_cast<float>(cols);
+    const float inv_rms = 1.0f / sqrtf(mean_square + kEps);
+
+    for (int col = tid; col < cols; col += blockDim.x) {
+        y[row_offset + col] = x[row_offset + col] * inv_rms;
+    }
+}
+
+
+void launch_v4(const float* x, float* y, int rows, int cols) {
+    kernel_v4<<<rows, kBlockSize>>>(x, y, rows, cols);
+}
+
 }  // namespace
 
 int main() {
@@ -278,8 +332,10 @@ int main() {
     const size_t bytes = elems * sizeof(float);
     const size_t traffic_bytes_v12 = elems * sizeof(float) * 4;
     const size_t traffic_bytes_v3 = elems * sizeof(float) * 3;
+    const size_t traffic_bytes_v4 = elems * sizeof(float) * 3;
     const size_t flops_v12 = elems * 6;
     const size_t flops_v3 = elems * 7;
+    const size_t flops_v4 = elems * 3;
 
     float *d_x = nullptr, *d_y = nullptr;
     CUDA_CHECK(cudaMalloc(&d_x, bytes));
@@ -287,9 +343,10 @@ int main() {
 
     random_fill(d_x, elems, 2029);
 
-    std::vector<float> h_x(elems), h_ref(elems), h_out(elems);
+    std::vector<float> h_x(elems), h_ref(elems), h_ref_rmsnorm(elems), h_out(elems);
     CUDA_CHECK(cudaMemcpy(h_x.data(), d_x, bytes, cudaMemcpyDeviceToHost));
     cpu_ref(h_x, h_ref, rows, cols);
+    cpu_ref_rmsnorm(h_x, h_ref_rmsnorm, rows, cols);
 
     std::cout << "version            ms        GB/s     TFLOPS     max_err\n";
 
@@ -298,12 +355,14 @@ int main() {
         void (*launch)(const float*, float*, int, int);
         size_t traffic_bytes;
         size_t flops;
+        const std::vector<float>* ref;
     };
 
-    const std::array<Version, 3> versions{{
-        {"naive", launch_naive, traffic_bytes_v12, flops_v12},
-        {"v2_block_warp", launch_v2, traffic_bytes_v12, flops_v12},
-        {"v3_welford", launch_v3, traffic_bytes_v3, flops_v3},
+    const std::array<Version, 4> versions{{
+        {"naive", launch_naive, traffic_bytes_v12, flops_v12, &h_ref},
+        {"v2_block_warp", launch_v2, traffic_bytes_v12, flops_v12, &h_ref},
+        {"v3_welford", launch_v3, traffic_bytes_v3, flops_v3, &h_ref},
+        {"v4_rmsnorm", launch_v4, traffic_bytes_v4, flops_v4, &h_ref_rmsnorm},
     }};
 
     for (const auto& version : versions) {
@@ -312,7 +371,7 @@ int main() {
         CUDA_CHECK(cudaDeviceSynchronize());
 
         CUDA_CHECK(cudaMemcpy(h_out.data(), d_y, bytes, cudaMemcpyDeviceToHost));
-        const float err = max_abs_err(h_out.data(), h_ref.data(), h_out.size());
+        const float err = max_abs_err(h_out.data(), version.ref->data(), h_out.size());
         if (err > 1e-5f) {
             std::cerr << "correctness failed: max_err=" << err << '\n';
             CUDA_CHECK(cudaFree(d_x));

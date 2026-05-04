@@ -53,29 +53,24 @@
 1. naive multi-pass LayerNorm：一个线程处理一行，分别求 mean、variance，再归一化写回
 2. optimized baseline：一个 block 处理一行，复用 warp shuffle + shared memory 做行内归约
 3. Welford variance：一次统计扫描同时得到 mean 和 variance，减少一次读取 `x`
+4. RMSNorm：去掉 mean 统计，只归约 `sum(x^2)` 并按均方根缩放
 
-**当前瓶颈**：memory-bound + Welford arithmetic/reduction overhead；v3 已把统计阶段从两次读取 `x` 降到一次，但当前默认规模下额外算术和 combine 开销基本抵消了访存收益。
+**当前瓶颈**：memory-bound + row-level reduction overhead；v4 和 v3 一样是两次读 `x`、一次写 `y`，但 RMSNorm 的统计量更简单，当前默认规模下只比 v3 略快。
 
-**后续参考**：后续重点放在 fused affine 和 RMSNorm。
+**后续参考**：可选做 fused affine（`gamma/beta` 或 RMSNorm `gamma`），否则建议进入 GEMM 主线。
+
+### GEMM（矩阵乘法）
+1. naive：一个线程计算一个 `C[row, col]`
+
+**当前瓶颈**：memory-bound + no explicit data reuse；naive 版为每个输出元素重复读取 `A/B`，没有把 tile 内可复用的数据缓存到 shared memory。
+
+**后续参考**：下一步做 shared memory tile；后续再进入 register tile、tile 参数与 occupancy/register pressure、vectorized load、double buffering、`cp.async` 和 Tensor Core。
 
 ---
 
 ## 🔜 下一步候选
 
 下面步骤是路线参考，不代表已经实现或已经实测；实际学习时仍然每轮只引入一个主要优化手段。后续算子可以把已经学过的优化手段作为 baseline 组合使用；每个步骤只标出本轮真正新增的核心概念。
-
-### GEMM（矩阵乘法）
-学习价值：串联二维 tiling、shared memory 复用、register tile 和更高阶的矩阵乘优化。
-
-推荐步骤：
-1. naive：一个线程计算一个 `C[row, col]`
-2. shared memory tile：把 `A/B` tile 搬到 shared memory，减少 global memory 重复读取
-3. register tile：一个线程计算多个输出元素，提高每次读入数据的复用
-4. tile 参数与 occupancy / register pressure 分析：解释 tile 过大为什么可能变慢
-5. vectorized global load：用连续向量化访存改善 global load/store 指令效率
-6. double buffering：计算当前 tile 时预取下一 tile，隐藏部分访存延迟
-7. `cp.async`（硬件支持时）：异步拷贝 global 到 shared memory，减少同步等待
-8. Tensor Core（硬件支持时）：用 WMMA / MMA 提高低精度矩阵乘吞吐
 
 ### Conv2d（二维卷积）
 学习价值：理解卷积如何转化或映射成矩阵乘，并观察数据复用与边界处理。
