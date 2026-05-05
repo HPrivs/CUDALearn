@@ -64,10 +64,12 @@
 2. shared memory tile：一个 block 负责一个输出 tile，把可复用的 `A/B` 片段缓存到 shared memory
 3. register tile：一个线程计算同列两个输出元素，在寄存器中维护两个累加器并复用 shared memory 读出的 `B`
 4. `2 x 2` register tile：一个线程计算 4 个输出元素，同时扩大输出 tile 的行和列，观察有效访存下降与 register/shared-memory pressure 的取舍
+5. 收官版 `4 x 4` register tile：当前 `sm_61` 硬件上可验证的 FP32 手写 CUDA 版本；继续降低有效 DRAM 访存，同时记录 register pressure 和 occupancy 风险
+6. Tensor Core + `cp.async` 路径：`sm_80+` 专用，FP16 input + FP32 accumulation/output，用 WMMA fragment 和 async global-to-shared pipeline 改写 GEMM
 
-**当前瓶颈**：higher AI + sync/shared-memory/register pressure tradeoff；v4 通过 `2 x 2` register tile 继续提高复用，但仍有每个 `K` tile 两次同步，寄存器和 shared memory 用量继续上升。
+**当前瓶颈**：v5 是当前本机可实测 FP32 标量收官版；v6 已能 `sm_80` 交叉编译并在 SASS 中确认 `LDGSTS/HMMA`，但仍需用户在 `sm_80+` 硬件上实测 correctness、TFLOPS 和 profiler 指标。
 
-**后续参考**：下一步建议在 v4 baseline 上学习 vectorized load；后续再进入 double buffering、`cp.async` 和 Tensor Core。
+**后续参考**：在用户 `sm_80+` 硬件上运行 `nvcc -arch=sm_80 -DGEMM_ENABLE_SM80_TC src/gemm.cu -o debugger/gemm_tc && ./debugger/gemm_tc`，再基于实测决定是否继续做 `ldmatrix`/shared-memory swizzle/multi-stage pipeline。
 
 ---
 

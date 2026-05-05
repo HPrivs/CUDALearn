@@ -35,6 +35,7 @@ __global__ void kernel_naive(const float* a, const float* b, float* c, int m, in
 
 ### 批改反馈
 
+
 结论：大部分正确，但边界检查有一个关键 bug。
 
 - `row/col` 的计算、`kk` 循环、`A[row, kk] * B[kk, col]`、写回 `C[row, col]` 都写对了。
@@ -201,6 +202,58 @@ v3 的输出 tile 是 `32 x 16`。请推导一个输出 tile 对 `A/B` 的 globa
 
 ### 题目 2
 如果继续扩大到 `4 x 4` register tile，你预期有效 DRAM 访存、register pressure、occupancy 会分别怎样变化？为什么它不一定继续加速？
+
+### 我的答案
+
+
+### 自我检查
+
+
+### 批改反馈
+
+
+## v5 作业
+
+### 题目 1
+从 v2、v3、v4 到 v5，分别写出每个版本每个 `C` 元素摊销的 `A/B` global load：`K/16`、`K/32`、`K/64` 分别来自哪里？
+
+### 我的答案
+
+
+### 自我检查
+
+
+### 批改反馈
+
+
+### 题目 2
+如果把 v5 继续扩大到 `8 x 8` register tile，你预计会发生什么？请同时从有效 DRAM 访存、register pressure、occupancy、spill 风险和 block 数量五个角度判断。
+
+### 我的答案
+
+
+### 自我检查
+
+
+### 批改反馈
+
+
+## v6 作业
+
+### 题目 1
+为什么 v6 不能继续使用 v1-v5 的 FP32 CPU reference 和 `1e-4` 误差阈值？请从 input quantization 和 accumulation 两个角度说明。
+
+### 我的答案
+
+
+### 自我检查
+
+
+### 批改反馈
+
+
+### 题目 2
+画出 v6 一个 block 内 4 个 warp 分别负责哪个 `16 x 16` C fragment，并说明 `tile_a[2] / tile_b[2]` 的 double buffer 在哪一步被交换。
 
 ### 我的答案
 
