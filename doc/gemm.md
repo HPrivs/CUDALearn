@@ -5,6 +5,7 @@
 - 理解二维输出矩阵如何映射到 `grid/block/thread`。
 - 建立 naive GEMM 的 correctness、benchmark 和定量分析基线。
 - 学习 shared memory tiling：把输出 tile 内重复使用的 `A/B` 数据缓存到 shared memory。
+- 学习 register tile：一个线程维护多个寄存器累加器，提高 shared memory 数据的线程内复用。
 
 ## 前置知识
 - GEMM：General Matrix Multiplication，通用矩阵乘法。
@@ -13,6 +14,7 @@
 - output tile：一个 thread block 覆盖的 `C` 矩阵小矩形区域。
 - shared memory：同一个 thread block 内线程共享的片上存储，延迟通常低于 global memory，但容量有限且需要显式搬运数据。
 - `__syncthreads()`：thread block 内的同步屏障，保证所有线程都到达该点后才继续执行。
+- register tile：一个线程计算多个输出元素，并在 register 中保存多个 partial sum。
 
 ## 问题规格
 - 输入：矩阵 `A`，形状为 `M x K`
@@ -23,7 +25,7 @@
 - 默认规模：`M = 512, N = 512, K = 512`
 - 存储布局：`A/B/C` 都是 row-major
 
-v1 先实现最小正确版本：一个线程计算一个 `C[row, col]`。v2 引入 shared memory tile，但仍不做 register tile，也不调用 cuBLAS。
+v1 先实现最小正确版本：一个线程计算一个 `C[row, col]`。v2 引入 shared memory tile。v3 在 v2 基础上做 `2 x 1` register tile，但仍不调用 cuBLAS。
 
 ## v1 — naive
 
@@ -82,11 +84,11 @@ v1 先实现最小正确版本：一个线程计算一个 `C[row, col]`。v2 引
 nvcc src/gemm.cu -o debugger/gemm && ./debugger/gemm
 ```
 
-当前记录，默认 `M = 512, N = 512, K = 512`，`timeit` 使用 `warmup=3, iters=20`。v2 本轮多次运行，下表取最小值：
+当前记录，默认 `M = 512, N = 512, K = 512`，`timeit` 使用 `warmup=3, iters=20`。v3 本轮重新运行 3 次，下表取 naive 的最小值：
 
 | version | ms | GB/s | TFLOPS | max_err |
 | --- | ---: | ---: | ---: | ---: |
-| naive | 4.4663 | 240.64 | 0.0601 | 0.000034 |
+| naive | 4.5547 | 235.97 | 0.0589 | 0.000034 |
 
 本次 `max_err = 3.43323e-05`，低于代码里的 `1e-4` correctness 阈值。误差来自 GPU float 累加和 CPU double reference 后转回 float 的差异，量级符合当前 `K = 512` 的预期。
 
@@ -145,7 +147,7 @@ v2 的 FLOPs 不变，仍是每个输出元素 `K` 次乘法和 `K` 次加法。
 
 默认规模下，v2 的有效访存 `B = 68,157,440 bytes`，约 `68.16 MB`；v1 naive 逻辑访存是约 `1.075 GB`。有效访存口径下，`A/B` global load 下降接近 `16x`，算术强度从约 `0.25 FLOP/Byte` 提高到约 `3.94 FLOP/Byte`。
 
-瓶颈定性判定：**less memory-bound, but still far from compute-bound**。实测 `TFLOPS` 从 `0.0601` 提高到 `0.1325`，说明减少 global load 有效；但加速只有约 `2.21x`，没有接近逻辑访存下降比例。原因是 naive 版已有硬件 cache 自动复用一部分数据，v2 又引入 shared memory 读写、每个 `tile_k` 两次 `__syncthreads()`，并且仍然是每个线程只算一个输出元素。
+瓶颈定性判定：**less memory-bound, but still far from compute-bound**。本轮重新实测时，`TFLOPS` 从 `0.0589` 提高到 `0.1310`，说明减少 global load 有效；但加速只有约 `2.22x`，没有接近逻辑访存下降比例。原因是 naive 版已有硬件 cache 自动复用一部分数据，v2 又引入 shared memory 读写、每个 `tile_k` 两次 `__syncthreads()`，并且仍然是每个线程只算一个输出元素。
 
 可验证的 NCU metric 名继续沿用 v1 已列出的 global memory 和 SM 指标，例如 `dram__bytes_read`、`dram__bytes_write`、`dram__throughput`、`sm__throughput`、`smsp__inst_executed_op_global_ld` 和 `smsp__warp_issue_stalled_long_scoreboard_per_warp_active`。本机执行 `ncu --query-metrics` 返回 `Skipping unsupported chip GP108`，因此本轮没有新增 shared-memory 专项 metric 名，也没有写入 profiler 实测数据。
 
@@ -156,14 +158,14 @@ v2 的 FLOPs 不变，仍是每个输出元素 `K` 次乘法和 `K` 次加法。
 nvcc src/gemm.cu -o debugger/gemm && ./debugger/gemm
 ```
 
-当前记录，默认 `M = 512, N = 512, K = 512`，`timeit` 使用 `warmup=3, iters=20`。本轮多次运行，下表取最小值：
+当前记录，默认 `M = 512, N = 512, K = 512`，`timeit` 使用 `warmup=3, iters=20`。v3 本轮重新运行 3 次，下表取每版最小值：
 
 | version | ms | GB/s | TFLOPS | max_err |
 | --- | ---: | ---: | ---: | ---: |
-| naive | 4.4663 | 240.64 | 0.0601 | 0.000034 |
-| v2_smem | 2.0254 | 33.65 | 0.1325 | 0.000034 |
+| naive | 4.5547 | 235.97 | 0.0589 | 0.000034 |
+| v2_smem | 2.0492 | 33.26 | 0.1310 | 0.000034 |
 
-这里 `GB/s` 使用各版本自己的有效访存字节计算。v2 的 `GB/s` 数字更低，不代表带宽利用更差；它的分母已经从约 `1.075 GB` 降到约 `68.16 MB`。跨版本更适合先看 `ms` 和 `TFLOPS`：v2 比 naive 快约 `2.21x`。
+这里 `GB/s` 使用各版本自己的有效访存字节计算。v2 的 `GB/s` 数字更低，不代表带宽利用更差；它的分母已经从约 `1.075 GB` 降到约 `68.16 MB`。跨版本更适合先看 `ms` 和 `TFLOPS`：v2 比 naive 快约 `2.22x`。
 
 ### 当前瓶颈
 v2 主要瓶颈从「重复 global memory load」转向：
@@ -194,12 +196,107 @@ for (int tile_k = 0; tile_k < k; tile_k += 16) {
 }
 ```
 
+## v3 — 2x1 register tile
+
+### 本版学习目标
+本轮唯一新增核心概念是 **register tile**：一个线程不再只维护一个 `sum`，而是在 register 里维护多个 partial sum，让一次 shared memory 读取服务多个输出元素。
+
+v3 采用最小改动的 `2 x 1` 形式：一个线程计算同一列上的两个 `C` 元素。这样可以重点观察寄存器累加带来的复用变化，而不同时引入 vectorized load、double buffering 或 Tensor Core。
+
+### 改了什么
+v2 的一个 block 负责 `16 x 16` 输出 tile，共 256 个输出元素。v3 仍使用 `blockDim = (16, 16)`，但一个 block 负责 `32 x 16` 输出 tile：
+
+- `row0 = blockIdx.y * 32 + threadIdx.y`。
+- `row1 = row0 + 16`。
+- `col = blockIdx.x * 16 + threadIdx.x`。
+- 每个线程维护 `sum0` 和 `sum1` 两个寄存器累加器。
+- shared memory 变为 `tile_a[32][16]` 和 `tile_b[16][16]`。
+
+### 为什么可能更快
+v2 中每个线程只算一个输出元素。进入 `inner` 循环时，线程从 shared memory 读出一个 `B[inner, col]` 后只用于一次乘加。
+
+v3 中同一个线程计算两个同列输出：
+
+```cpp
+const float b_val = tile_b[inner][tx];
+sum0 += tile_a[ty][inner] * b_val;
+sum1 += tile_a[ty + 16][inner] * b_val;
+```
+
+这让一次 `tile_b` shared load 服务两个累加器。输出 tile 的高度也从 16 变成 32，所以同一块 `B` tile 被 32 行输出复用，默认规模下 `B` 的有效 global load 次数减半。
+
+### 代码要点
+- v3 不能让 `row1` 越界线程提前 `return`，因为整个 block 后面仍然要经过 `__syncthreads()`。
+- `row0` 和 `row1` 分别做边界检查；越界的 `A` 元素写 `0.0f` 到 shared memory。
+- `B` tile 仍是 `16 x 16`，由所有线程按 `tile_b[ty][tx]` 搬运。
+- 本版只做 `2 x 1` register tile，复用的是 `B` 值；如果改成 `1 x 2`，复用方向会变成 `A` 值。
+
+### 定量分析
+v3 的 FLOPs 仍然不变，每个输出元素还是 `K` 次乘法和 `K` 次加法。变化在有效 global memory 读写量和 shared memory 读取复用。
+
+| 量 | 表达式 | 说明 |
+| --- | --- | --- |
+| 访存字节 `B` | `(M*K*ceil(N/16) + K*N*ceil(M/32) + M*N) * 4` | `A` 对每个输出 tile 列读一次，`B` 对每个 32 行输出 tile 读一次，`C` 写一次 |
+| FLOPs `F` | `M * N * 2K` | 与 v1/v2 相同 |
+| 算术强度 `AI` | `F / B` | 默认规模约 `5.22 FLOP/Byte` |
+
+默认规模下，v3 的有效访存 `B = 51,380,224 bytes`，约 `51.38 MB`；v2 是约 `68.16 MB`。v3 相比 v2 主要减少的是 `B` 的有效 global load：`ceil(M/16)` 个输出行 tile 变成 `ceil(M/32)` 个输出行 tile。
+
+瓶颈定性判定：**less memory-bound + register/shared-memory reuse, still sync-limited**。实测 `TFLOPS` 从 v2 的 `0.1310` 提高到 `0.2113`，说明 register tile 提高复用有效；但它仍然远低于理想 GEMM。主要原因是每个 `K` tile 仍有两次 `__syncthreads()`，每个线程只做两个输出，tile 参数也还没有围绕 occupancy 和 register pressure 调整。
+
+可验证的 NCU metric 名：
+
+- `smsp__inst_executed_op_shared_ld`
+- `smsp__inst_executed_op_shared_st`
+- `smsp__warp_issue_stalled_barrier_per_warp_active`
+- `dram__bytes_read`
+- `dram__bytes_write`
+- `sm__throughput`
+
+其中前三个已用 `ncu --chips ga100 --query-metrics` 查询确认。本机实际 GPU 仍无法采集 Nsight Compute profiler 数据。另用 `nvcc --ptxas-options=-v src/gemm.cu -o debugger/gemm_ptxas` 查看编译资源：`kernel_v2` 使用 27 registers、2048B shared memory；`kernel_v3` 使用 31 registers、3072B shared memory，且没有 spill。
+
+### 实测结果
+用下面命令编译并实测：
+
+```bash
+nvcc src/gemm.cu -o debugger/gemm && ./debugger/gemm
+```
+
+当前记录，默认 `M = 512, N = 512, K = 512`，`timeit` 使用 `warmup=3, iters=20`。本轮重复运行 3 次，下表取每版最小值：
+
+| version | ms | GB/s | TFLOPS | max_err |
+| --- | ---: | ---: | ---: | ---: |
+| naive | 4.5547 | 235.97 | 0.0589 | 0.000034 |
+| v2_smem | 2.0492 | 33.26 | 0.1310 | 0.000034 |
+| v3_reg_tile | 1.2706 | 40.44 | 0.2113 | 0.000034 |
+
+相对本轮重新测得的 v2，v3 约快 `2.0492 / 1.2706 = 1.61x`。相对 naive，v3 约快 `3.58x`。
+
+### 当前瓶颈
+v3 已经比 v2 更快，但仍有几个明显限制：
+
+- 每个 `tile_k` 阶段仍有两次 block-level 同步。
+- `2 x 1` register tile 只复用 `B`，没有同时做 `M x N` 的二维 register tile。
+- register 数从 v2 的 27 增加到 31；当前没有 spill，但更大的 register tile 可能降低 occupancy。
+- shared memory 仍按标量方式加载，没有 vectorized load，也没有 double buffering。
+
+### 代价或限制
+register tile 用更多寄存器和更多 shared memory 换更高的数据复用。`2 x 1` 版本比较适合教学，因为索引变化小；但它不是最终 GEMM 形态。继续增大每线程输出数量时，需要同时关注 register pressure、occupancy、shared memory 容量和访存指令形状。
+
+### 下一步
+下一轮建议进入 tile 参数与 occupancy/register pressure 分析：对比 `1 x 2`、`2 x 1`、`2 x 2` 或不同 block shape，观察 register 数、shared memory、block 数和实际性能之间的取舍。
+
+### v3 作业
+1. 推导题：v3 的输出 tile 是 `32 x 16`。请推导一个输出 tile 对 `A/B` 的 global load 数量，并说明为什么相对 v2 主要减少的是 `B` 读取而不是 `A` 读取。
+2. 预测题：如果把 v3 改成 `1 x 2` register tile，一个线程计算同一行的两个相邻列，理论上会减少 `A` 还是 `B` 的有效 global load？它可能引入哪些新的代价？
+
 ## 对比总表
 
 | version | 核心手段 | 逻辑读写 | ms | GB/s | TFLOPS | max_err | 瓶颈 |
 | --- | --- | --- | ---: | ---: | ---: | ---: | --- |
-| naive | 一个线程计算一个 `C[row, col]` | 每个输出读 `A/B` 各 `K` 次，写 `C` 1 次 | 4.4663 | 240.64 | 0.0601 | 0.000034 | memory-bound + no explicit data reuse |
-| v2_smem | shared memory tile | `A/B` 按输出 tile 复用，默认有效访存约 `68.16 MB` | 2.0254 | 33.65 | 0.1325 | 0.000034 | less memory-bound + sync/shared-memory overhead |
+| naive | 一个线程计算一个 `C[row, col]` | 每个输出读 `A/B` 各 `K` 次，写 `C` 1 次 | 4.5547 | 235.97 | 0.0589 | 0.000034 | memory-bound + no explicit data reuse |
+| v2_smem | shared memory tile | `A/B` 按 `16 x 16` 输出 tile 复用，默认有效访存约 `68.16 MB` | 2.0492 | 33.26 | 0.1310 | 0.000034 | less memory-bound + sync/shared-memory overhead |
+| v3_reg_tile | `2 x 1` register tile | `B` 按 `32 x 16` 输出 tile 复用，默认有效访存约 `51.38 MB` | 1.2706 | 40.44 | 0.2113 | 0.000034 | less memory-bound + register/shared-memory reuse, still sync-limited |
 
 ## 参考资料
 - CUDA C++ Programming Guide：thread hierarchy、global memory coalescing、shared memory。

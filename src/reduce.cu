@@ -250,8 +250,8 @@ __global__ void kernel_v5_stage1(const float* x, float* partial, int n) {
 
     int tid = threadIdx.x;
     int block_start = blockIdx.x * blockDim.x * kItemsPerThread;
-    float sum = 0.0f;
 
+    float sum = 0.0f;
     for (int i = 0; i < kItemsPerThread; ++i) {
         int idx = block_start + i * blockDim.x + tid;
         if (idx < n) {
@@ -264,7 +264,6 @@ __global__ void kernel_v5_stage1(const float* x, float* partial, int n) {
         partial[blockIdx.x] = sum;
     }
 }
-
 
 __global__ void kernel_v5_stage2(const float* partial, float* y, int partial_count) {
     __shared__ float warp_sums[kWarpsPerBlock];

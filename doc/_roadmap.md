@@ -62,10 +62,11 @@
 ### GEMM（矩阵乘法）
 1. naive：一个线程计算一个 `C[row, col]`
 2. shared memory tile：一个 block 负责一个输出 tile，把可复用的 `A/B` 片段缓存到 shared memory
+3. register tile：一个线程计算同列两个输出元素，在寄存器中维护两个累加器并复用 shared memory 读出的 `B`
 
-**当前瓶颈**：less memory-bound + sync/shared-memory overhead；v2 有效减少了重复 global load，但仍是每个线程只算一个输出元素，shared memory 复用深度有限。
+**当前瓶颈**：less memory-bound + sync/shared-memory/register pressure tradeoff；v3 通过 `2 x 1` register tile 继续提高复用，但仍有每个 `K` tile 两次同步，且 tile 参数尚未系统分析。
 
-**后续参考**：下一步做 register tile；后续再进入 tile 参数与 occupancy/register pressure、vectorized load、double buffering、`cp.async` 和 Tensor Core。
+**后续参考**：下一步分析 tile 参数与 occupancy/register pressure；后续再进入 vectorized load、double buffering、`cp.async` 和 Tensor Core。
 
 ---
 

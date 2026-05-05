@@ -76,12 +76,25 @@ __global__ void kernel_naive(const float* a, const float* b, float* c, int m, in
 
 ### 我的答案
 
+`TILE=16`时，v2情况下：每行/列仅从DRAM读一次，读TILE行/列，因此，A的global load数量`16 * K`, B的 global load数量`K * 16`；
+naive情况下：若计算C的每个元素都要从DRAM读取A和B共`2 * K`，且因重复读取`TILE * TILE`次，总共要读取`2 * K * 16 * 16`，A和B的global load分别都是`K * 16 * 16`。
 
 ### 自我检查
 
+忘了解释`C`的输出矩阵元素个数没变所以`C`的写回次数也不变。
 
 ### 批改反馈
 
+结论：A/B 的数量级推导基本正确，但需要补上 `C` 写回为什么不变，并把“读一次”的范围说清楚。
+
+关键要点：
+
+- 对一个 `16 x 16` 输出 tile，naive 中每个 `C` 元素都要读 `K` 个 `A` 和 `K` 个 `B`。因此 `A` 的逻辑 global load 是 `16 * 16 * K = 256K` 个 float，`B` 也是 `256K` 个 float，合计 `512K` 个 float。
+- v2 中这个输出 tile 会按 `K` 方向分阶段缓存。对完整 `K` 来说，`A` 只需要为这个 tile 读 `16 * K` 个 float，`B` 只需要读 `K * 16` 个 float，合计 `32K` 个 float。默认 `TILE=16` 时，`A/B` 的逻辑 global load 降为 naive 的 `1/16`。
+- 你说的“每行/列仅从 DRAM 读一次”要限定在“同一个输出 tile 内、对每个 `kk`”这个范围。不同输出 tile 之间仍可能重复读同一段 `A/B`，实际是否来自 DRAM 还会受 L1/L2 cache 影响。
+- `C` 的写回次数没有减少，因为输出矩阵的元素个数没有变。这个 `16 x 16` tile 仍然有 256 个 `C[row, col]`，每个最终结果都必须写回一次；tiling 只减少 `A/B` 的重复读取，不减少输出元素数量。
+
+标准思路：先按“每个输出元素需要多少输入”算 naive，再按“一个 tile 每个 `kk` 只需要多少唯一的 `A/B` 元素”算 v2，最后单独统计 `C` 写回。
 
 ### 题目 2
 下面这段 shared memory tile 代码有什么问题？至少指出两个 bug，并说明会导致死锁、越界还是结果错误。
@@ -97,6 +110,48 @@ for (int tile_k = 0; tile_k < k; tile_k += 16) {
     }
 }
 ```
+
+### 我的答案
+
+1、每轮sum累加结束都要__syncthreads进行block-level同步，不然可能会出现结果错误；
+2、没有检查a和b数组访问是否越界，`tile_k + tx < k`和`tile_k + ty < k`；
+3、这里显式指定了`kTile=16`，如果tx或者ty的blockDim不为16，会出现访问未覆盖完全的情况。
+
+### 自我检查
+
+新的点：在`__syncthreads()`之前提前`return`可能会组合成死锁风险。因为剩下的线程可能永远等不到`return`的线程。正确做法是越界线程给共享内存写`0.0f`。
+
+在softmax和layernorm内没有错误是因为整个block线程一起退出了，因此不会出现与block其他线程同步问题。
+
+### 批改反馈
+
+结论：你指出了两个真正关键的问题：缺少 K 方向边界检查，以及缺少下一轮覆盖 shared memory 前的同步。还需要补充一个更严重的 bug：开头的提前 `return` 会和 `__syncthreads()` 组合成死锁风险。
+
+关键要点：
+
+- `if (row >= m || col >= n) return;` 放在 `__syncthreads()` 前是错误的。一个 block 里只要有部分线程越界提前返回，剩下线程进入 `__syncthreads()` 后就可能永远等不到这些线程，后果是死锁或 kernel hang。正确做法是所有线程都走到同步点，越界线程给 `tile_a/tile_b` 写 `0.0f`，最后写回 `C` 时再判断边界。
+- 你写的 `tile_k + tx < k` 和 `tile_k + ty < k` 是对的。没有这两个检查时，如果 `K` 不是 16 的倍数，最后一个 `K` tile 会越界读取 `A` 或 `B`，结果可能错误，也可能触发非法访问。
+- 第一条“每轮 sum 累加结束都要 `__syncthreads()`”方向正确。更精确地说，这个同步是为了防止有些线程已经进入下一轮 `tile_k` 并覆盖 `tile_a/tile_b`，而另一些线程还在读取当前轮的 shared memory；缺少它会造成 shared memory read/write race，通常表现为结果错误。
+- 第 3 条在当前题设下不算主要 bug。这个版本本来就假设 `blockDim.x = blockDim.y = kTileK = 16`；如果以后要支持其他 block shape，确实需要重新设计 `tile_a/tile_b` 的维度和加载映射，但这不是这段代码相对 v2 正确写法的核心错误。
+
+标准思路：这段代码至少要修三类问题：不能在 barrier 前让部分线程提前退出；每次 global load 都要做 `row/col/K` 边界检查并给 shared memory 补零；当前 tile 计算结束后要同步，再允许下一轮覆盖 shared memory。
+
+## v3 作业
+
+### 题目 1
+v3 的输出 tile 是 `32 x 16`。请推导一个输出 tile 对 `A/B` 的 global load 数量，并说明为什么相对 v2 主要减少的是 `B` 读取而不是 `A` 读取。
+
+### 我的答案
+
+
+### 自我检查
+
+
+### 批改反馈
+
+
+### 题目 2
+如果把 v3 改成 `1 x 2` register tile，一个线程计算同一行的两个相邻列，理论上会减少 `A` 还是 `B` 的有效 global load？它可能引入哪些新的代价？
 
 ### 我的答案
 
