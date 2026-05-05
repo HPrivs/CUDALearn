@@ -63,10 +63,11 @@
 1. naive：一个线程计算一个 `C[row, col]`
 2. shared memory tile：一个 block 负责一个输出 tile，把可复用的 `A/B` 片段缓存到 shared memory
 3. register tile：一个线程计算同列两个输出元素，在寄存器中维护两个累加器并复用 shared memory 读出的 `B`
+4. `2 x 2` register tile：一个线程计算 4 个输出元素，同时扩大输出 tile 的行和列，观察有效访存下降与 register/shared-memory pressure 的取舍
 
-**当前瓶颈**：less memory-bound + sync/shared-memory/register pressure tradeoff；v3 通过 `2 x 1` register tile 继续提高复用，但仍有每个 `K` tile 两次同步，且 tile 参数尚未系统分析。
+**当前瓶颈**：higher AI + sync/shared-memory/register pressure tradeoff；v4 通过 `2 x 2` register tile 继续提高复用，但仍有每个 `K` tile 两次同步，寄存器和 shared memory 用量继续上升。
 
-**后续参考**：下一步分析 tile 参数与 occupancy/register pressure；后续再进入 vectorized load、double buffering、`cp.async` 和 Tensor Core。
+**后续参考**：下一步建议在 v4 baseline 上学习 vectorized load；后续再进入 double buffering、`cp.async` 和 Tensor Core。
 
 ---
 

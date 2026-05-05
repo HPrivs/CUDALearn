@@ -9,6 +9,8 @@
 //     = (2K/16 + 1) * 4B
 //   v3_reg_tile with 32x16 output tiles: read about K/16 A + K/32 B + write one C
 //     = (K/16 + K/32 + 1) * 4B
+//   v4_2d_reg_tile with 32x32 output tiles: read about K/32 A + K/32 B + write one C
+//     = (K/32 + K/32 + 1) * 4B
 // reported FLOPs per output element:
 //   K multiply + K add = 2K FLOPs
 
@@ -31,6 +33,8 @@ constexpr int kBlockY = 16;
 constexpr int kTileK = 16;
 constexpr int kV3RowsPerThread = 2;
 constexpr int kV3TileM = kBlockY * kV3RowsPerThread;
+constexpr int kV4ColsPerThread = 2;
+constexpr int kV4TileN = kBlockX * kV4ColsPerThread;
 
 int div_up(int a, int b) {
     return (a + b - 1) / b;
@@ -124,23 +128,23 @@ __global__ void kernel_v3(const float* a, const float* b, float* c, int m, int n
     __shared__ float tile_a[kV3TileM][kTileK];
     __shared__ float tile_b[kTileK][kBlockX];
 
-    int tx = threadIdx.x;
     int ty = threadIdx.y;
+    int tx = threadIdx.x;
     int row0 = blockIdx.y * kV3TileM + ty;
     int row1 = row0 + kBlockY;
-    int col = blockIdx.x * kBlockX + tx;
+    int col = blockIdx.x * blockDim.x + tx;
 
     float sum0 = 0.0f;
     float sum1 = 0.0f;
     for (int tile_k = 0; tile_k < k; tile_k += kTileK) {
-        const int a_col = tile_k + tx;
-        const int b_row = tile_k + ty;
+        int a_col = tile_k + tx;
+        int b_row = tile_k + ty;
 
-        tile_a[ty][tx] = (row0 < m && a_col < k) ?
+        tile_a[ty][tx] = (row0 < m && a_col < k) ? 
                             a[static_cast<size_t>(row0) * k + a_col] : 0.0f;
         tile_a[ty + kBlockY][tx] = (row1 < m && a_col < k) ?
                             a[static_cast<size_t>(row1) * k + a_col] : 0.0f;
-        tile_b[ty][tx] = (b_row < k && col < n) ?
+        tile_b[ty][tx] = (col < n && b_row < k) ?
                             b[static_cast<size_t>(b_row) * n + col] : 0.0f;
         __syncthreads();
 
@@ -166,6 +170,70 @@ void launch_v3(const float* a, const float* b, float* c, int m, int n, int k) {
     kernel_v3<<<grid, block>>>(a, b, c, m, n, k);
 }
 
+// ========= v4: 2x2 register tile =========
+// 2D register tile 解决的问题：同时扩大输出 tile 的行和列，让一个线程的多个寄存器累加器复用 A 和 B 两侧数据。
+__global__ void kernel_v4(const float* a, const float* b, float* c, int m, int n, int k) {
+    __shared__ float tile_a[kV3TileM][kTileK];
+    __shared__ float tile_b[kTileK][kV4TileN];
+
+    const int ty = threadIdx.y;
+    const int tx = threadIdx.x;
+    const int row0 = blockIdx.y * kV3TileM + ty;
+    const int row1 = row0 + kBlockY;
+    const int col0 = blockIdx.x * kV4TileN + tx;
+    const int col1 = col0 + kBlockX;
+
+    float sum00 = 0.0f;
+    float sum01 = 0.0f;
+    float sum10 = 0.0f;
+    float sum11 = 0.0f;
+    for (int tile_k = 0; tile_k < k; tile_k += kTileK) {
+        const int a_col = tile_k + tx;
+        const int b_row = tile_k + ty;
+
+        tile_a[ty][tx] = (row0 < m && a_col < k) ?
+                            a[static_cast<size_t>(row0) * k + a_col] : 0.0f;
+        tile_a[ty + kBlockY][tx] = (row1 < m && a_col < k) ?
+                            a[static_cast<size_t>(row1) * k + a_col] : 0.0f;
+        tile_b[ty][tx] = (b_row < k && col0 < n) ?
+                            b[static_cast<size_t>(b_row) * n + col0] : 0.0f;
+        tile_b[ty][tx + kBlockX] = (b_row < k && col1 < n) ?
+                            b[static_cast<size_t>(b_row) * n + col1] : 0.0f;
+        __syncthreads();
+
+        for (int inner = 0; inner < kTileK; inner++) {
+            const float a0 = tile_a[ty][inner];
+            const float a1 = tile_a[ty + kBlockY][inner];
+            const float b0 = tile_b[inner][tx];
+            const float b1 = tile_b[inner][tx + kBlockX];
+            sum00 += a0 * b0;
+            sum01 += a0 * b1;
+            sum10 += a1 * b0;
+            sum11 += a1 * b1;
+        }
+        __syncthreads();
+    }
+
+    if (row0 < m && col0 < n) {
+        c[static_cast<size_t>(row0) * n + col0] = sum00;
+    }
+    if (row0 < m && col1 < n) {
+        c[static_cast<size_t>(row0) * n + col1] = sum01;
+    }
+    if (row1 < m && col0 < n) {
+        c[static_cast<size_t>(row1) * n + col0] = sum10;
+    }
+    if (row1 < m && col1 < n) {
+        c[static_cast<size_t>(row1) * n + col1] = sum11;
+    }
+}
+
+void launch_v4(const float* a, const float* b, float* c, int m, int n, int k) {
+    const dim3 block(kBlockX, kBlockY);
+    const dim3 grid(div_up(n, kV4TileN), div_up(m, kV3TileM));
+    kernel_v4<<<grid, block>>>(a, b, c, m, n, k);
+}
+
 }  // namespace
 
 int main() {
@@ -187,6 +255,10 @@ int main() {
          elems_c) * sizeof(float);
     const size_t traffic_bytes_v3 =
         (elems_a * static_cast<size_t>(div_up(n, kBlockX)) +
+         elems_b * static_cast<size_t>(div_up(m, kV3TileM)) +
+         elems_c) * sizeof(float);
+    const size_t traffic_bytes_v4 =
+        (elems_a * static_cast<size_t>(div_up(n, kV4TileN)) +
          elems_b * static_cast<size_t>(div_up(m, kV3TileM)) +
          elems_c) * sizeof(float);
     const size_t flops_naive = elems_c * static_cast<size_t>(2 * k);
@@ -213,10 +285,11 @@ int main() {
         size_t flops;
     };
 
-    const std::array<Version, 3> versions{{
+    const std::array<Version, 4> versions{{
         {"naive", launch_naive, traffic_bytes_naive, flops_naive},
         {"v2_smem", launch_v2, traffic_bytes_v2, flops_naive},
         {"v3_reg_tile", launch_v3, traffic_bytes_v3, flops_naive},
+        {"v4_2d_reg_tile", launch_v4, traffic_bytes_v4, flops_naive},
     }};
 
     for (const auto& version : versions) {

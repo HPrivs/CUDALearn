@@ -142,6 +142,55 @@ for (int tile_k = 0; tile_k < k; tile_k += 16) {
 v3 的输出 tile 是 `32 x 16`。请推导一个输出 tile 对 `A/B` 的 global load 数量，并说明为什么相对 v2 主要减少的是 `B` 读取而不是 `A` 读取。
 
 ### 我的答案
+在输出tile中，A的global load：`32K`个flaot；B的global load: `16K`个float。
+因为使用了`2x1`寄存器使得每tile的读取的行数增加了，总体上tile的块数减少了，且tile内的`B`的global load不变，所以v3减少了`B`的读取。
+
+
+### 自我检查
+
+
+### 批改反馈
+
+结论：数量推导基本正确，解释方向也对，但需要把“单个输出 tile 内”和“整个矩阵全局重复加载次数”分开说清楚。
+
+关键要点：
+
+- 对一个 `32 x 16` 输出 tile，完整扫过 `K` 维时，`A` 需要覆盖 32 行、K 列，所以 global load 是 `32K` 个 float；`B` 需要覆盖 K 行、16 列，所以 global load 是 `16K` 个 float。你这里写对了。
+- 相比 v2 的 `16 x 16` 输出 tile，单个 tile 的 `A` load 从 `16K` 变成 `32K`，但这个 tile 也计算了两倍的输出行数；摊到每个 C 元素，`A` 仍是 `K/16` 个 float，没有变。
+- `B` 的关键变化是复用高度从 16 行变成 32 行。单个 v3 tile 的 `B` load 仍是 `16K`，但它服务的是 `32 x 16` 个输出；摊到每个 C 元素，`B` 从 v2 的 `K/16` 降到 `K/32`。
+- “总体上 tile 的块数减少了”要限定为 `M` 方向的输出 tile 数从 `ceil(M/16)` 变成 `ceil(M/32)`。`N` 方向 tile 数没有变，所以 `A` 仍会被每个输出列 tile 重复加载；减少的是 `B` 被不同输出行 tile 重复加载的次数。
+
+标准思路：先按单个输出 tile 算唯一 global load：`A = TILE_M * K`、`B = K * TILE_N`；再除以输出元素数 `TILE_M * TILE_N` 得到每个 C 的摊销访存。v3 的 `TILE_M=32, TILE_N=16`，所以 `A=K/16` 不变，`B=K/32` 减半。
+
+### 题目 2
+如果把 v3 改成 `1 x 2` register tile，一个线程计算同一行的两个相邻列，理论上会减少 `A` 还是 `B` 的有效 global load？它可能引入哪些新的代价？
+
+### 我的答案
+
+如果改成`1 x 2` register tile，那么C tile为`16 rows x 32 cols`。这样A的元素可被复用32次，B的元素可被复用16次；理论上减少`A`的global load。由于引入了`1 x 2`register tile，每个线程串行的压力可能增大，多了一次DRAM的读取和多了一个C元素的计算。
+
+### 自我检查
+
+
+### 批改反馈
+
+结论：判断正确，`1 x 2` register tile 理论上主要减少 `A` 的有效 global load；但“多了一次 DRAM 读取”这个代价表述不准确。
+
+关键要点：
+
+- `1 x 2` 时，一个 block 的输出 tile 会倾向于变成 `16 x 32`。同一个 `A[row, kk]` 可以服务 32 个相邻输出列，所以 `A` 的摊销 global load 从 `K/16` 降到 `K/32`。
+- `B[kk, col]` 仍主要沿输出行方向复用。如果输出 tile 高度还是 16，`B` 的摊销 global load 仍是 `K/16`，不会像 v3 的 `2 x 1` 那样减半。
+- 新代价不是“多一次 DRAM 读取”。register tile 的目的正是减少某一侧的有效 global load；真正增加的是每个线程多维护一个 accumulator，寄存器压力会上升，并且 shared memory tile 形状会变成更宽的 `tile_b[16][32]` 或需要每个线程搬更多 B 元素。
+- 还要考虑 global load coalescing 和 shared memory 访问形态。`1 x 2` 复用的是 `A` 值，inner loop 中可能写成一个 `a_val` 配两个 `B` 值；这会增加每个线程的 shared memory 读取数量，且如果用 256 个线程覆盖 `16 x 32` 的 B tile，加载映射会比当前 `16 x 16` 更复杂。
+
+标准思路：`2 x 1` 拉高输出 tile，减少 `B` 的行向重复加载；`1 x 2` 拉宽输出 tile，减少 `A` 的列向重复加载。两者都增加寄存器累加器，但会改变 shared memory tile 大小、加载分工和线程内 shared load 结构。
+
+## v4 作业
+
+### 题目 1
+对 `32 x 32` 输出 tile，推导 v4 单个 tile 对 `A/B` 的 global load 数量，并把它摊到每个 `C` 元素。和 v3 相比，哪一项减少了？
+
+### 我的答案
 
 
 ### 自我检查
@@ -151,7 +200,7 @@ v3 的输出 tile 是 `32 x 16`。请推导一个输出 tile 对 `A/B` 的 globa
 
 
 ### 题目 2
-如果把 v3 改成 `1 x 2` register tile，一个线程计算同一行的两个相邻列，理论上会减少 `A` 还是 `B` 的有效 global load？它可能引入哪些新的代价？
+如果继续扩大到 `4 x 4` register tile，你预期有效 DRAM 访存、register pressure、occupancy 会分别怎样变化？为什么它不一定继续加速？
 
 ### 我的答案
 
