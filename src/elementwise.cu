@@ -93,7 +93,7 @@ int main() {
     CUDA_CHECK(cudaMemcpy(h_b.data(), d_b, bytes, cudaMemcpyDeviceToHost));
     cpu_ref(h_a, h_b, h_ref);
 
-    std::cout << "version            ms        GB/s     TFLOPS     max_err\n";
+    print_header();
 
     struct Version {
         const char* name;
@@ -111,7 +111,14 @@ int main() {
         CUDA_CHECK(cudaDeviceSynchronize());
 
         CUDA_CHECK(cudaMemcpy(h_out.data(), d_c, bytes, cudaMemcpyDeviceToHost));
-        float err = max_abs_err(h_out.data(), h_ref.data(), h_out.size());
+        float err = 0.0f;
+        if (!check_close(h_out.data(), h_ref.data(), h_out.size(), 0.0f, 0.0f, &err)) {
+            std::cerr << "correctness failed: max_err=" << err << '\n';
+            CUDA_CHECK(cudaFree(d_a));
+            CUDA_CHECK(cudaFree(d_b));
+            CUDA_CHECK(cudaFree(d_c));
+            return 1;
+        }
 
         float ms = timeit([&] { version.launch(d_a, d_b, d_c, n); });
         CUDA_CHECK(cudaGetLastError());

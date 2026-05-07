@@ -25,10 +25,6 @@ constexpr int kCols = 4096;
 constexpr int kBlockSize = 256;
 constexpr int kWarpSize = 32;
 
-int div_up(int a, int b) {
-    return (a + b - 1) / b;
-}
-
 void cpu_ref(const std::vector<float>& x, std::vector<float>& y, int rows, int cols) {
     for (int row = 0; row < rows; ++row) {
         const size_t row_offset = static_cast<size_t>(row) * cols;
@@ -342,7 +338,7 @@ int main() {
     CUDA_CHECK(cudaMemcpy(h_x.data(), d_x, bytes, cudaMemcpyDeviceToHost));
     cpu_ref(h_x, h_ref, rows, cols);
 
-    std::cout << "version            ms        GB/s     TFLOPS     max_err\n";
+    print_header();
 
     struct Version {
         const char* name;
@@ -364,8 +360,8 @@ int main() {
         CUDA_CHECK(cudaDeviceSynchronize());
 
         CUDA_CHECK(cudaMemcpy(h_out.data(), d_y, bytes, cudaMemcpyDeviceToHost));
-        float err = max_abs_err(h_out.data(), h_ref.data(), h_out.size());
-        if (err > 1e-5f) {
+        float err = 0.0f;
+        if (!check_close(h_out.data(), h_ref.data(), h_out.size(), 1e-5f, 1e-5f, &err)) {
             std::cerr << "correctness failed: max_err=" << err << '\n';
             CUDA_CHECK(cudaFree(d_x));
             CUDA_CHECK(cudaFree(d_y));

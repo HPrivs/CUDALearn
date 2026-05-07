@@ -152,6 +152,7 @@ v3 的输出 tile 是 `32 x 16`。请推导一个输出 tile 对 `A/B` 的 globa
 
 ### 批改反馈
 
+
 结论：数量推导基本正确，解释方向也对，但需要把“单个输出 tile 内”和“整个矩阵全局重复加载次数”分开说清楚。
 
 关键要点：
@@ -238,10 +239,10 @@ v3 的输出 tile 是 `32 x 16`。请推导一个输出 tile 对 `A/B` 的 globa
 ### 批改反馈
 
 
-## v6 作业
+## cuBLAS 基线作业
 
 ### 题目 1
-为什么 v6 不能继续使用 v1-v5 的 FP32 CPU reference 和 `1e-4` 误差阈值？请从 input quantization 和 accumulation 两个角度说明。
+为什么 row-major `C = A * B` 可以用 cuBLAS column-major 的 `C^T = B^T * A^T` 实现？请把 `m/n/k/lda/ldb/ldc` 分别对应到代码里的参数。
 
 ### 我的答案
 
@@ -253,7 +254,7 @@ v3 的输出 tile 是 `32 x 16`。请推导一个输出 tile 对 `A/B` 的 globa
 
 
 ### 题目 2
-画出 v6 一个 block 内 4 个 warp 分别负责哪个 `16 x 16` C fragment，并说明 `tile_a[2] / tile_b[2]` 的 double buffer 在哪一步被交换。
+为什么 `cublas_sgemm` 这一行的 `GB/s` 不适合直接和 v5 的 `GB/s` 比较？更应该优先比较哪个指标？
 
 ### 我的答案
 

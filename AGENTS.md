@@ -17,7 +17,8 @@ root/
 ├── src/          # common.cuh, X.cu
 ├── doc/          # _roadmap.md, X.md, _nsight.md, _glossary.md
 ├── homework/     # X.md，用户作业和批改反馈
-└── debugger/     # 编译输出
+├── debugger/     # 编译输出
+└── reference/    # 外部 CUDA/C++ 专业实现参考，只作阅读、方法和代码风格参考
 ```
 
 ## 请求分类
@@ -30,7 +31,7 @@ root/
 
 ### Build Mode
 
-触发：祈使句 + 算子名，或明确要求实现/优化某个版本。例如「学习 vec_add」「继续优化 gemm」「给 reduce 加 v2 shared memory」。
+触发：祈使句 + 算子名，或明确要求实现/优化某个版本。例如「学习 X」「继续优化 X」「给 X 加 vN 某优化」。
 
 每轮闭环：
 
@@ -46,6 +47,8 @@ Build 规则：
 - 一轮默认只引入一个主要优化手段；若用户要求多个手段，拆成多个版本或说明耦合原因。
 - 已经学过且本轮不是重点的优化手段可以合并使用，以提高学习效率；但必须在文档中区分“本轮新增概念”和“复用旧技巧”，并用 benchmark 说明合并后的净效果。
 - 开始新算子或选择下一轮优化前，先检查与已学算子的重复度；若主要手段已在前面充分学习过，优先压缩为 baseline 组合，不单独展开完整学习轮次，除非本轮目标是验证该手段在新问题形态下的适用边界。
+- 若 `reference/` 中有同类算子或相关优化实现，开始设计前先检索并阅读相关 `.cu/.cc/.h/makefile`，提取 tile shape、线程/warp 分工、访存路径、pipeline 和硬件前提；实现仍必须按本项目渐进教学风格重写，不能直接把复杂版本整段搬进 `src/X.cu`。
+- 参考实现只作为专业方法和代码风格参考；若它依赖 PyTorch extension、外部库、特定架构指令或非本项目目录中的头文件，必须在文档中说明依赖差异，并优先写成当前 `src/common.cuh` 可支撑的自包含 CUDA 程序。
 - 能编译运行就编译运行；缺 `nvcc`、GPU 或权限时，写明未验证原因，禁止伪造实测结果。
 - 新手法首次出现时，在代码或文档中用 1 句中文解释“它解决了什么问题”。
 - 首次学习算子 `X`：创建 `src/X.cu`（仅 `naive + main`）、`doc/X.md`、`homework/X.md`，并更新 `doc/_roadmap.md`。
@@ -55,7 +58,7 @@ Build 规则：
 
 ### Q&A Mode
 
-触发：疑问句、陈述语气、概念比较、代码解释、作业批改。例如「为什么这样写」「怎么理解 coalesced access」「批改 vec_add 作业」。
+触发：疑问句、陈述语气、概念比较、代码解释、作业批改。例如「为什么这样写」「怎么理解某术语」「批改 X 作业」。
 
 规则：
 
@@ -69,13 +72,22 @@ Build 规则：
 
 ## 路线设计准则
 
+- `AGENTS.md` 只保留路线设计方法论，不记录具体某个算子的推荐学习流程；具体算子步骤、先后顺序和候选列表只写入 `doc/_roadmap.md`。
 - 候选列表按学习依赖排序，不按炫技程度排序。
 - 主线优先遵循经典 CUDA 优化路径：正确性基线 -> global memory 访问模式 -> block/thread 粒度 -> shared memory tiling/reduction -> per-thread register accumulation -> warp-level primitive -> 参数/occupancy/register pressure 分析 -> fusion/online 算法改写 -> 硬件特性。
+- 设计路线时可以借鉴 `reference/` 中更成熟实现的版本拆分，但要按“学习增量”重新排序：先抽出最小可解释版本，再逐步引入参考实现里的 advanced features。
 - 当多个优化手段已经在前面算子中学过，可以在后续算子中作为 baseline 组合使用；路线图仍只把真正的新概念列为本轮学习重点。
 - 每次推进路线时要评估“学习增量 / 重复度”：重复 shared memory reduce、warp shuffle、vectorized load 等旧技巧时，只保留它们对当前算子瓶颈的定量验证；文档重点转向 variance、fusion、tiling、online algorithm 等新问题。
-- `warp-level` 优化通常放在算法级改写前；例如 Softmax 先学 warp reduce，再学 online softmax。
-- GEMM 主线应覆盖 shared memory tile、register tile、tile 参数与 occupancy/register pressure、vectorized load、double buffering、`cp.async`、Tensor Core。
-- 硬件专属特性必须标注前提，禁止默认使用 `sm_90` 独占特性，例如 `TMA / wgmma / DSMEM / thread block cluster`。
+- `warp-level` 优化通常放在更大粒度的算法级改写前，先把通信和执行粒度讲清，再讨论跨 tile 或跨阶段的算法变化。
+- 硬件专属特性必须标注前提，禁止默认使用当前机器或当前编译目标不支持的独占特性。
+
+## `reference/` 使用规则
+
+- `reference/` 是只读参考区，不属于本项目学习轮次的交付代码；除非用户明确要求清理或整理 reference，否则 Build Mode 不修改其中内容。
+- 优先阅读同名或同类算子的 `.cu/.cc/.h/makefile`，不要依赖已清理掉的 README、Python benchmark 或安装脚本。
+- 引用参考实现时，文档只写“参考了哪些思路”：例如 tile shape、load/store packing、shared memory layout、warp tiling、`cp.async` stage 数；不要把 reference 的性能数据当成本项目实测。
+- 若参考实现使用外部框架或更高架构特性，必须降级成当前项目可编译版本，或明确标注未实现/未验证原因。
+- 代码风格可以参考 `reference/` 的命名、边界处理、benchmark 和资源分析习惯，但本项目优先写清楚算子本体和优化点；避免大量 template、宏元编程或框架包装，只有在 dtype、tile 参数或重复 launch 逻辑确实需要复用时才引入少量模板。
 
 ## `doc/_roadmap.md`
 
@@ -104,6 +116,7 @@ Build 规则：
 - 编译运行：`nvcc src/X.cu -o debugger/X && ./debugger/X`。
 - `src/X.cu` 必须能独立编译；不写只存在于文档中的伪代码。
 - 边界条件必须真实处理，不能只支持整除规模，除非本轮教学明确声明限制并在下一步修复。
+- 代码优先显式、局部、可读；不要为了贴近专业库风格过早引入复杂模板层。模板和宏只服务于减少真实重复，不能遮住 kernel 的索引、访存和同步逻辑。
 
 ## `doc/X.md` 约定
 
@@ -151,9 +164,12 @@ Build 规则：
 
 - `CUDA_CHECK(expr)`。
 - `float timeit(launcher_lambda, int warmup=3, int iters=20)`。
-- `random_fill<T>(T* d_ptr, size_t n, unsigned seed)`。
-- `max_abs_err<T>(const T* a, const T* b, size_t n)`：失败时打印首个坏下标。
+- `BenchmarkStats timeit_stats(launcher_lambda, int warmup=3, int iters=20, int repeats=5)`：用于波动较明显时报告 min/mean/max。
+- `random_fill<T>(T* d_ptr, size_t n, unsigned seed, float low=-1.0f, float high=1.0f)`。
+- `max_abs_err<T>(const T* a, const T* b, size_t n)`。
+- `check_close<T>(const T* got, const T* ref, size_t n, float atol, float rtol, float* out_max_err=nullptr)`：失败时打印首个超过容差的下标。
 - `print_row(const char* version, float ms, size_t bytes, size_t flops, float err)`：打印 `ms / 有效 GB/s / TFLOPS / max_err`。
+- `print_header()` 和 `print_device_info()`：统一 benchmark 输出格式和机器信息。
 
 ## Benchmark 与验证规则
 

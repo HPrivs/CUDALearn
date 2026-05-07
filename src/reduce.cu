@@ -9,6 +9,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <iostream>
 #include <vector>
 
@@ -32,7 +33,11 @@ void benchmark_version(const char* version, Launcher&& launcher, const float* d_
     CUDA_CHECK(cudaDeviceSynchronize());
 
     CUDA_CHECK(cudaMemcpy(h_out.data(), d_y, sizeof(float), cudaMemcpyDeviceToHost));
-    float err = max_abs_err(h_out.data(), h_ref.data(), h_out.size());
+    float err = 0.0f;
+    if (!check_close(h_out.data(), h_ref.data(), h_out.size(), 1.0f, 1e-4f, &err)) {
+        std::cerr << "correctness failed: max_err=" << err << '\n';
+        std::exit(EXIT_FAILURE);
+    }
 
     float ms = timeit([&] { launcher(d_x, d_y, d_partial, n); }, warmup, iters);
     CUDA_CHECK(cudaGetLastError());
@@ -40,10 +45,6 @@ void benchmark_version(const char* version, Launcher&& launcher, const float* d_
     print_row(version, ms, traffic_bytes, flops, err);
 }
 
-
-int div_up(int a, int b) {
-    return (a + b - 1) / b;
-}
 
 void cpu_ref(const std::vector<float>& x, std::vector<float>& y) {
     double sum = 0.0;
@@ -212,7 +213,7 @@ void launch_v4(const float* x, float* y, float* partial, int n) {
 // ========= v5: warp shuffle block reduce =========
 // warp shuffle 让同一个 warp 内的线程直接交换 register 值，
 // 减少 shared memory 读写和部分 __syncthreads()。
-__device__ float warp_reduce_sum(float value) {
+__device__ __forceinline__ float warp_reduce_sum(float value) {
     // warp内规约
     for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
         // 0xffffffff是warp掩膜; value表示给其他线程读取的register值; delta=offset向下读取距离
@@ -222,7 +223,7 @@ __device__ float warp_reduce_sum(float value) {
     return value;
 }
 
-__device__ float block_reduce_sum_v5(float value, float* warp_sums) {
+__device__ __forceinline__ float block_reduce_sum_v5(float value, float* warp_sums) {
     int tid = threadIdx.x;
     // 线程在warp内的编号，kWarpSize-1作掩码，范围在0~31
     int lane = tid & (kWarpSize - 1);
@@ -314,20 +315,27 @@ int main() {
     CUDA_CHECK(cudaMemcpy(h_x.data(), d_x, input_bytes, cudaMemcpyDeviceToHost));
     cpu_ref(h_x, h_ref);
 
-    std::cout << "version            ms        GB/s     TFLOPS     max_err\n";
+    print_header();
 
-    benchmark_version("naive", launch_naive, d_x, d_y, d_partial, n, traffic_bytes,
-                      flops, h_ref, h_out, kBenchmarkWarmup, kBenchmarkIters);
-    benchmark_version("v2_smem", launch_v2, d_x, d_y, d_partial, n, traffic_bytes,
-                      flops, h_ref, h_out, kBenchmarkWarmup, kBenchmarkIters);
-    benchmark_version("v3_items16", launch_v3, d_x, d_y, d_partial, n, traffic_bytes,
-                      flops, h_ref, h_out, kBenchmarkWarmup, kBenchmarkIters);
-    benchmark_version("v4_two_pass", launch_v4, d_x, d_y, d_partial, n,
-                      traffic_bytes_v4, flops, h_ref, h_out, kBenchmarkWarmup,
-                      kBenchmarkIters);
-    benchmark_version("v5_warp_shuffle", launch_v5, d_x, d_y, d_partial, n,
-                      traffic_bytes_v4, flops, h_ref, h_out, kBenchmarkWarmup,
-                      kBenchmarkIters);
+    struct Version {
+        const char* name;
+        void (*launch)(const float*, float*, float*, int);
+        size_t traffic_bytes;
+    };
+
+    const std::array<Version, 5> versions{{
+        {"naive", launch_naive, traffic_bytes},
+        {"v2_smem", launch_v2, traffic_bytes},
+        {"v3_items16", launch_v3, traffic_bytes},
+        {"v4_two_pass", launch_v4, traffic_bytes_v4},
+        {"v5_warp_shuffle", launch_v5, traffic_bytes_v4},
+    }};
+
+    for (const auto& version : versions) {
+        benchmark_version(version.name, version.launch, d_x, d_y, d_partial, n,
+                          version.traffic_bytes, flops, h_ref, h_out,
+                          kBenchmarkWarmup, kBenchmarkIters);
+    }
 
     CUDA_CHECK(cudaFree(d_partial));
     CUDA_CHECK(cudaFree(d_x));
