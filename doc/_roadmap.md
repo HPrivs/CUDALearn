@@ -68,12 +68,13 @@
 4. `2 x 2` register tile：一个线程计算 4 个输出元素，同时扩大输出 tile 的行和列，观察有效访存下降与 register/shared-memory pressure 的取舍
 5. 收官版 `4 x 4` register tile：当前可验证的 FP32 手写 CUDA 版本；继续降低有效 DRAM 访存，同时记录 register pressure 和 occupancy 风险
 6. cuBLAS SGEMM 对比基线：用库函数给手写 kernel 提供同机同规模的性能参考，不作为手写优化步骤
+7. FP32 scalar 深化线 `gemm_fp32_scalar`：新开独立文件，组合验证 `8 x 8` thread tile、`float4` packed load/store、shared memory layout/padding 和 software double buffering；不引入 Tensor Core
 
-**当前瓶颈**：v5 是当前可实测 FP32 标量手写收官版；`cublas_sgemm` 作为库函数参考明显更快，但内部 tiling 和调度不在当前教学文件中展开。
+**当前瓶颈**：`gemm.cu` 的 v5 是简洁教学线 FP32 标量手写收官版；`gemm_fp32_scalar.cu` 是参考 `reference/kernels/sgemm/` 后新开的 FP32 scalar 深化线。cuBLAS 仍明显更快，但内部 tiling 和调度不在当前教学文件中展开。
 
 **后续参考**：可参考 `reference/kernels/sgemm/`、`reference/kernels/hgemm/`、`reference/kernels/swizzle/` 和 `reference/kernels/ws-hgemm/`。建议拆成两条线：
 
-- FP32 scalar 深化线：`8 x 8` thread tile 或更合理的 `BM/BN/BK/TM/TN` 参数 -> `float4` vectorized load/store -> shared memory layout/padding/swizzle -> double buffering -> `cp.async`（要求 `sm_80+`）。
+- FP32 scalar 后续：继续做 `cp.async`（要求 `sm_80+`）或 block swizzle；两者都不属于 Tensor Core，但会增加硬件和调度复杂度。
 - Tensor Core 线：FP16 input + FP32 accumulation 的 WMMA baseline -> shared memory staging + fragment layout -> `mma.sync m16n8k16` -> warp/MMA tiling -> multi-stage pipeline -> block swizzle / shared memory swizzle。`wgmma`、TMA、DSMEM 只作为 `sm_90+` 参考，不默认进入本项目实现。
 
 ---
