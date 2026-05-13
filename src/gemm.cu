@@ -22,6 +22,7 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <nvToolsExt.h>
 
 #include <array>
 #include <cstdio>
@@ -103,6 +104,7 @@ void cpu_ref(const std::vector<float>& a,
     }
 }
 
+
 // ========= v1: naive one thread per C element =========
 // naive 解决的问题：先把 GEMM 的二维输出映射和 dot product 公式写正确。
 __global__ void kernel_naive(const float* a, const float* b, float* c, int m, int n, int k) {
@@ -129,35 +131,32 @@ void launch_naive(const float* a, const float* b, float* c, int m, int n, int k)
 // ========= v2: shared memory tile =========
 // shared memory tiling 解决的问题：把一个输出 tile 内会重复读取的 A/B 片段缓存起来，减少 global memory load。
 __global__ void kernel_v2(const float* a, const float* b, float* c, int m, int n, int k) {
-    __shared__ float tile_a[kBlockY][kTileK];
-    __shared__ float tile_b[kTileK][kBlockX];
+    __shared__ float smem_a[kBlockY][kTileK];
+    __shared__ float smem_b[kTileK][kBlockX];
 
-    int tx = threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
     int ty = threadIdx.y;
-    int row = blockDim.y * blockIdx.y + ty;
-    int col = blockDim.x * blockIdx.x + tx;
+    int tx = threadIdx.x;
 
-    float sum = 0.0f;
+    float sum = 0.0;
     for (int tile_k = 0; tile_k < k; tile_k += kTileK) {
-        const int a_col = tile_k + tx;
-        const int b_row = tile_k + ty;
-        tile_a[ty][tx] = (row < m && a_col < k) ? 
-                            a[static_cast<size_t>(row) * k + a_col] : 0.0f;
-        tile_b[ty][tx] = (b_row < k && col < n) ? 
-                            b[static_cast<size_t>(b_row) * n + col] : 0.0f;
+        size_t a_col = tile_k + tx;
+        size_t b_row = tile_k + ty;
+        smem_a[ty][tx] = (row < m && a_col < k) ? a[static_cast<size_t>(row) * k + a_col] : 0.0f;
+        smem_b[ty][tx] = (b_row < k && col < n) ? b[static_cast<size_t>(b_row) * n + col] : 0.0f;
         __syncthreads();
 
         for (int inner = 0; inner < kTileK; inner++) {
-            sum += tile_a[ty][inner] * tile_b[inner][tx];
+            sum += smem_a[ty][inner] * smem_b[inner][tx];
         }
         __syncthreads();
     }
-    
+
     if (row < m && col < n) {
         c[static_cast<size_t>(row) * n + col] = sum;
     }
-
-} 
+}
 
 void launch_v2(const float* a, const float* b, float* c, int m, int n, int k) {
     const dim3 block(kBlockX, kBlockY);
@@ -416,13 +415,21 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_b, bytes_b));
     CUDA_CHECK(cudaMalloc(&d_c, bytes_c));
 
+    nvtxRangePushA("random_fill");
     random_fill(d_a, elems_a, 2031);
     random_fill(d_b, elems_b, 2032);
+    nvtxRangePop();
 
     std::vector<float> h_a(elems_a), h_b(elems_b), h_ref(elems_c), h_out(elems_c);
+    
+    nvtxRangePushA("copy_input_to_host");
     CUDA_CHECK(cudaMemcpy(h_a.data(), d_a, bytes_a, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_b.data(), d_b, bytes_b, cudaMemcpyDeviceToHost));
+    nvtxRangePop();
+
+    nvtxRangePushA("cpu_ref");
     cpu_ref(h_a, h_b, h_ref, m, n, k);
+    nvtxRangePop();
 
     CUBLAS_CHECK(cublasCreate(&g_cublas_handle));
     CUBLAS_CHECK(cublasSetMathMode(g_cublas_handle, CUBLAS_PEDANTIC_MATH));

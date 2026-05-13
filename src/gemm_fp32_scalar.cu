@@ -22,6 +22,7 @@
 #include <iostream>
 #include <vector>
 
+
 const char* cublas_status_to_string(cublasStatus_t status) {
     switch (status) {
         case CUBLAS_STATUS_SUCCESS:
