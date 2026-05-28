@@ -1,100 +1,55 @@
-// GEMM: C[M, N] = A[M, K] * B[K, N]
+// GEMM FP32 scalar v2: C[M, N] = A[M, K] * B[K, N]
 // C[row, col] = sum_k A[row, k] * B[k, col]
 // I/O shape: A is M x K, B is K x N, C is M x N, all row-major
-// dtype: float32
-// default problem size: M = 512, N = 512, K = 512
-// theoretical traffic per output element:
-//   naive: read K floats from A + K floats from B + write one C = (2K + 1) * 4B
-//   v2_smem with full 16x16 tiles: read about K/16 A + K/16 B + write one C
-//     = (2K/16 + 1) * 4B
-//   v3_reg_tile with 32x16 output tiles: read about K/16 A + K/32 B + write one C
-//     = (K/16 + K/32 + 1) * 4B
-//   v4_2d_reg_tile with 32x32 output tiles: read about K/32 A + K/32 B + write one C
-//     = (K/32 + K/32 + 1) * 4B
-//   v5_final_4x4 with 64x64 output tiles: read about K/64 A + K/64 B + write one C
-//     = (K/64 + K/64 + 1) * 4B
-//   cublas_sgemm uses cuBLAS FP32 SGEMM as a library comparison baseline; reported traffic
-//     uses the minimum effective A + B + C bytes because cuBLAS internal tiling is opaque
+// dtype: float32 input, float32 accumulation, float32 output
+// default problem size: M = 1024, N = 1024, K = 1024
+// theoretical global memory traffic:
+//   each 128x128 C tile reloads A/B K tiles from global memory;
+//   for divisible sizes, global traffic is grid_m * grid_n * k_tiles *
+//   (BM * BK + BK * BN) * 4B + M * N * 4B
 // reported FLOPs per output element:
 //   K multiply + K add = 2K FLOPs
 
 #include "common.cuh"
 
-#include <cublas_v2.h>
 #include <cuda_runtime.h>
-#include <nvToolsExt.h>
 
-#include <array>
 #include <cstdio>
 #include <cstdlib>
-#include <iostream>
 #include <vector>
-
-const char* cublas_status_to_string(cublasStatus_t status) {
-    switch (status) {
-        case CUBLAS_STATUS_SUCCESS:
-            return "CUBLAS_STATUS_SUCCESS";
-        case CUBLAS_STATUS_NOT_INITIALIZED:
-            return "CUBLAS_STATUS_NOT_INITIALIZED";
-        case CUBLAS_STATUS_ALLOC_FAILED:
-            return "CUBLAS_STATUS_ALLOC_FAILED";
-        case CUBLAS_STATUS_INVALID_VALUE:
-            return "CUBLAS_STATUS_INVALID_VALUE";
-        case CUBLAS_STATUS_ARCH_MISMATCH:
-            return "CUBLAS_STATUS_ARCH_MISMATCH";
-        case CUBLAS_STATUS_MAPPING_ERROR:
-            return "CUBLAS_STATUS_MAPPING_ERROR";
-        case CUBLAS_STATUS_EXECUTION_FAILED:
-            return "CUBLAS_STATUS_EXECUTION_FAILED";
-        case CUBLAS_STATUS_INTERNAL_ERROR:
-            return "CUBLAS_STATUS_INTERNAL_ERROR";
-        case CUBLAS_STATUS_NOT_SUPPORTED:
-            return "CUBLAS_STATUS_NOT_SUPPORTED";
-        default:
-            return "CUBLAS_STATUS_UNKNOWN";
-    }
-}
-
-#define CUBLAS_CHECK(expr)                                                     \
-    do {                                                                       \
-        cublasStatus_t _status = (expr);                                       \
-        if (_status != CUBLAS_STATUS_SUCCESS) {                                \
-            std::fprintf(stderr, "cuBLAS error at %s:%d: %s\n", __FILE__,      \
-                         __LINE__, cublas_status_to_string(_status));          \
-            std::exit(EXIT_FAILURE);                                           \
-        }                                                                      \
-    } while (0)
 
 namespace {
 
 constexpr int kM = 1024;
 constexpr int kN = 1024;
 constexpr int kK = 1024;
-constexpr int kBlockX = 16;
-constexpr int kBlockY = 16;
-constexpr int kTileK = 16;
-constexpr int kV3RowsPerThread = 2;
-constexpr int kV3TileM = kBlockY * kV3RowsPerThread;
-constexpr int kV4ColsPerThread = 2;
-constexpr int kV4TileN = kBlockX * kV4ColsPerThread;
-constexpr int kV5RowsPerThread = 4;
-constexpr int kV5ColsPerThread = 4;
-constexpr int kV5TileM = kBlockY * kV5RowsPerThread;
-constexpr int kV5TileN = kBlockX * kV5ColsPerThread;
 
-cublasHandle_t g_cublas_handle = nullptr;
+constexpr int kBlockM = 128;
+constexpr int kBlockN = 128;
+constexpr int kBlockK = 8;
+constexpr int kThreadM = 8;
+constexpr int kThreadN = 8;
+// 一个 block 负责 128x128 个 C 元素；一个 thread 负责其中 8x8 个 C 元素。
+// 因此 block 内线程布局是 16x16，共 256 个线程。
+constexpr int kBlockDimX = kBlockN / kThreadN;
+constexpr int kBlockDimY = kBlockM / kThreadM;
+constexpr int kSmemPad = 4;
 
-void cpu_ref(const std::vector<float>& a, 
-             const std::vector<float>& b, 
-             std::vector<float>& c, 
-             int m, 
-             int n, 
+// CPU reference，用 double 累加减少参考答案自身的舍入误差。
+// a: host 端 A 矩阵，形状 [m, k]，row-major。
+// b: host 端 B 矩阵，形状 [k, n]，row-major。
+// c: host 端输出 C 矩阵，形状 [m, n]，row-major。
+// m/n/k: GEMM 的三个维度，计算 C[m, n] = A[m, k] * B[k, n]。
+void cpu_ref(const std::vector<float>& a,
+             const std::vector<float>& b,
+             std::vector<float>& c,
+             int m,
+             int n,
              int k) {
-    
-    for (int row = 0; row < m; row++) {
-        for (int col = 0; col < n; col++) {
+    for (int row = 0; row < m; ++row) {
+        for (int col = 0; col < n; ++col) {
             double sum = 0.0;
-            for (int kk = 0; kk < k; kk++) {
+            for (int kk = 0; kk < k; ++kk) {
                 const double av = static_cast<double>(a[static_cast<size_t>(row) * k + kk]);
                 const double bv = static_cast<double>(b[static_cast<size_t>(kk) * n + col]);
                 sum += av * bv;
@@ -104,379 +59,309 @@ void cpu_ref(const std::vector<float>& a,
     }
 }
 
+// 判断从一行矩阵里以 col 为起点读取 4 个 float 是否安全。
+// ld: 当前矩阵的 leading dimension，也就是 row-major 下每行元素数。
+// col: 本次访问的起始列。
+// width: 当前矩阵实际列数，用来判断 col..col+3 是否越界。
+__device__ __forceinline__ bool can_vectorize_row(int ld, int col, int width) {
+    return ((ld & 3) == 0) && ((col & 3) == 0) && (col + 3 < width);
+}
 
-// ========= v1: naive one thread per C element =========
-// naive 解决的问题：先把 GEMM 的二维输出映射和 dot product 公式写正确。
-__global__ void kernel_naive(const float* a, const float* b, float* c, int m, int n, int k) {
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
-    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+// 从 row-major 矩阵中读取连续 4 个 float；边界处自动补 0。
+// ptr: 矩阵起始地址。
+// ld: leading dimension，row-major 下等于矩阵每行元素数。
+// row/col: 读取起点，语义是 ptr[row, col..col+3]。
+// rows/cols: 矩阵实际形状，用于处理非整除边界。
+__device__ __forceinline__ float4 load_float4_or_zero(const float* ptr,
+                                                        int ld,
+                                                        int row,
+                                                        int col,
+                                                        int rows,
+                                                        int cols) {
 
-    if (row >= m || col >= n) {
+    float4 values = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    if (row >= rows || col >= cols)
+        return values;
+
+    const float* base = ptr + static_cast<size_t>(row) * ld + col;
+    if (can_vectorize_row(ld, col, cols)) {
+        return  *reinterpret_cast<const float4*>(base);
+    }
+
+    values.x = base[0];
+    if (col + 1 < cols)
+        values.y = base[1];
+    if (col + 2 < cols)
+        values.z = base[2];
+    if (col + 3 < cols) {
+        values.w = base[3];
+    }
+
+    return values;
+
+}
+
+// 向 row-major 矩阵写入连续 4 个 float；边界或未对齐时退化成标量写。
+// ptr: 矩阵起始地址。
+// ld: leading dimension，row-major 下等于矩阵每行元素数。
+// row/col: 写入起点，语义是 ptr[row, col..col+3]。
+// rows/cols: 矩阵实际形状，用于避免越界写。
+// values: 要写入的 4 个结果。
+__device__ __forceinline__ void store_float4_or_scalar(float* ptr,
+                                                        int ld,
+                                                        int row,
+                                                        int col,
+                                                        int rows,
+                                                        int cols,
+                                                        float4 values) {
+    if (row >= rows || col >= cols) {
         return;
     }
 
-    float sum = 0.0f;
-    for (int kk = 0; kk < k; kk++) {
-        sum += a[static_cast<size_t>(row) * k + kk] * b[static_cast<size_t>(kk) * n + col];
+    float* base = ptr + static_cast<size_t>(row) * ld + col;
+    if (can_vectorize_row(ld, col, cols)) {
+        *reinterpret_cast<float4*>(base) = values;
+        return;
     }
-    c[static_cast<size_t>(row) * n + col] = sum;
+
+    base[0] = values.x;
+    if (col + 1 < cols)
+        base[1] = values.y;
+    if (col + 2 < cols)
+        base[2] = values.z;
+    if (col + 3 < cols)
+        base[3] = values.w;
+
+}
+// 把当前 K tile 的 A/B 子块从 global memory 搬到 shared memory。
+// BM/BN/BK: 一个 CTA 负责的 C tile 形状 [BM, BN]，每次沿 K 维处理 BK 层。
+// PAD: shared memory 每行额外 padding，降低 bank conflict 风险。
+// a/b: device 端输入矩阵 A[m, k] 和 B[k, n]。
+// smem_a/smem_b: shared memory tile，布局分别是 [BK][BM + PAD] 和 [BK][BN + PAD]。
+// m/n/k: GEMM 的三个维度。
+// tile_k: 当前正在处理的 K 维 tile 起点。
+// block_row/block_col: 当前 CTA 负责的 C tile 左上角坐标。
+// tid: CTA 内线性线程号，用来分配每个线程搬哪一段 float4。
+template <int BM, int BN, int BK, int PAD>
+__device__ __forceinline__ void load_tile_float4(const float* __restrict__ a,
+                                                 const float* __restrict__ b,
+                                                 float (&smem_a)[BK][BM + PAD],
+                                                 float (&smem_b)[BK][BN + PAD],
+                                                 int m,
+                                                 int n,
+                                                 int k,
+                                                 int tile_k,
+                                                 int block_row,
+                                                 int block_col,
+                                                 int tid) {
+    int a_row = tid / (BK / 4);
+    int a_col_vec = (tid % (BK / 4)) * 4;
+    int b_row = tid / (BN / 4);
+    int b_col_vec = (tid % (BN / 4)) * 4;
+
+    const float4 av = load_float4_or_zero(a, k, block_row + a_row, tile_k + a_col_vec, m, k);
+    smem_a[a_col_vec + 0][a_row] = av.x;
+    smem_a[a_col_vec + 1][a_row] = av.y;
+    smem_a[a_col_vec + 2][a_row] = av.z;
+    smem_a[a_col_vec + 3][a_row] = av.w;
+
+    const float4 bv = load_float4_or_zero(b, n, tile_k + b_row, block_col + b_col_vec, k, n);
+    smem_b[b_row][b_col_vec + 0] = bv.x;
+    smem_b[b_row][b_col_vec + 1] = bv.y;
+    smem_b[b_row][b_col_vec + 2] = bv.z;
+    smem_b[b_row][b_col_vec + 3] = bv.w;
 }
 
-void launch_naive(const float* a, const float* b, float* c, int m, int n, int k) {
-    const dim3 block(kBlockX, kBlockY);
-    const dim3 grid(div_up(n, block.x), div_up(m, block.y));
-    kernel_naive<<<grid, block>>>(a, b, c, m, n, k);
-}
+// 使用 shared memory 中的一个 K tile，累加当前线程负责的 TM x TN 输出小块。
+// BM/BN/BK/PAD: shared memory tile 的形状参数，需和 load_tile_float4 保持一致。
+// TM/TN: 每个线程负责的 C 子块大小；本文件中为 8x8。
+// smem_a/smem_b: 已经装入 shared memory 的 A/B tile。
+// thread_tile_row/thread_tile_col: 当前线程负责的小块在 CTA 的 C tile 内的左上角。
+// acc: 当前线程私有的寄存器累加器，形状 [TM][TN]。
+template<int BM, int BN, int BK, int TM, int TN, int PAD>
+__device__ __forceinline__ void compute_tile(float (&smem_a)[BK][BM + PAD],
+                                             float (&smem_b)[BK][BN + PAD],
+                                             int thread_tile_row,
+                                             int thread_tile_col,
+                                             float (&acc)[TM][TN]) {
+    
+    #pragma unroll
+    for (int kk = 0; kk < BK; kk++) {
+        float a_frag[TM];
+        float b_frag[TN];
 
-// ========= v2: shared memory tile =========
-// shared memory tiling 解决的问题：把一个输出 tile 内会重复读取的 A/B 片段缓存起来，减少 global memory load。
-__global__ void kernel_v2(const float* a, const float* b, float* c, int m, int n, int k) {
-    __shared__ float smem_a[kBlockY][kTileK];
-    __shared__ float smem_b[kTileK][kBlockX];
-
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    int ty = threadIdx.y;
-    int tx = threadIdx.x;
-
-    float sum = 0.0;
-    for (int tile_k = 0; tile_k < k; tile_k += kTileK) {
-        size_t a_col = tile_k + tx;
-        size_t b_row = tile_k + ty;
-        smem_a[ty][tx] = (row < m && a_col < k) ? a[static_cast<size_t>(row) * k + a_col] : 0.0f;
-        smem_b[ty][tx] = (b_row < k && col < n) ? b[static_cast<size_t>(b_row) * n + col] : 0.0f;
-        __syncthreads();
-
-        for (int inner = 0; inner < kTileK; inner++) {
-            sum += smem_a[ty][inner] * smem_b[inner][tx];
+        #pragma unroll
+        for (int tm = 0; tm < TM; tm++) {
+            a_frag[tm] = smem_a[kk][thread_tile_row + tm];
         }
-        __syncthreads();
-    }
+        #pragma unroll
+        for (int tn = 0; tn < TN; tn++) {
+            b_frag[tn] = smem_b[kk][thread_tile_col + tn];
+        }
 
-    if (row < m && col < n) {
-        c[static_cast<size_t>(row) * n + col] = sum;
+        #pragma unroll
+        for (int tm = 0; tm < TM; tm++) {
+            #pragma unroll
+            for (int tn = 0; tn < TN; tn++) {
+                acc[tm][tn] = __fmaf_rn(a_frag[tm], b_frag[tn], acc[tm][tn]);
+            }
+        }
     }
 }
 
+template <int TM, int TN>
+// 把当前线程的 TM x TN 寄存器结果写回 global memory。
+// TM/TN: 每个线程负责的输出子块大小；本文件中 TN=8，所以每行拆成两个 float4。
+// c: device 端输出矩阵 C[m, n]。
+// m/n: C 的实际形状，用于处理边界。
+// block_row/block_col: 当前 CTA 负责的 C tile 左上角坐标。
+// thread_tile_row/thread_tile_col: 当前线程负责的小块在 CTA 的 C tile 内的左上角。
+// acc: 当前线程私有的寄存器累加器。
+__device__ __forceinline__ void store_tile_float4(float* __restrict__ c,
+                                                  int m,
+                                                  int n,
+                                                  int block_row,
+                                                  int block_col,
+                                                  int thread_tile_row,
+                                                  int thread_tile_col,
+                                                  float (&acc)[TM][TN]) {
+#pragma unroll
+    for (int tm = 0; tm < TM; ++tm) {
+        const int row = block_row + thread_tile_row + tm;
+        const int col = block_col + thread_tile_col;
+        store_float4_or_scalar(
+            c, n, row, col, m, n,
+            make_float4(acc[tm][0], acc[tm][1], acc[tm][2], acc[tm][3]));
+        store_float4_or_scalar(
+            c, n, row, col + 4, m, n,
+            make_float4(acc[tm][4], acc[tm][5], acc[tm][6], acc[tm][7]));
+    }
+}
+
+// ========= v2: float4 global load/store + padded shared memory layout =========
+// float4 和 padding 解决的问题：减少 global load/store 指令，并调整 shared memory stride 以降低 bank conflict 风险。
+// a/b/c: device 端矩阵 A[m, k]、B[k, n]、C[m, n]，全部 row-major。
+// m/n/k: GEMM 的三个维度，支持非 128 或 8 整除的边界规模。
+__global__ void kernel_v2(const float* __restrict__ a,
+                          const float* __restrict__ b,
+                          float* __restrict__ c,
+                          int m,
+                          int n,
+                          int k) {
+    __shared__ float smem_a[kBlockK][kBlockM + kSmemPad];
+    __shared__ float smem_b[kBlockK][kBlockN + kSmemPad];
+
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    const int block_row = blockIdx.y * kBlockM;
+    const int block_col = blockIdx.x * kBlockN;
+    const int thread_tile_row = threadIdx.y * kThreadM;
+    const int thread_tile_col = threadIdx.x * kThreadN;
+
+    float acc[kThreadM][kThreadN] = {};
+    for (int tile_k = 0; tile_k < k; tile_k += kBlockK) {
+        load_tile_float4<kBlockM, kBlockN, kBlockK, kSmemPad>(
+            a, b, smem_a, smem_b, m, n, k, tile_k, block_row, block_col, tid);
+        __syncthreads();
+
+        compute_tile<kBlockM, kBlockN, kBlockK, kThreadM, kThreadN, kSmemPad>(
+            smem_a, smem_b, thread_tile_row, thread_tile_col, acc);
+        __syncthreads();
+    }
+
+    store_tile_float4<kThreadM, kThreadN>(
+        c, m, n, block_row, block_col, thread_tile_row, thread_tile_col, acc);
+}
+
+// host 端 launch wrapper，统一 kernel 调用签名，方便后续放进 benchmark 表。
+// a/b/c: device 端矩阵 A[m, k]、B[k, n]、C[m, n]。
+// m/n/k: GEMM 的三个维度。
 void launch_v2(const float* a, const float* b, float* c, int m, int n, int k) {
-    const dim3 block(kBlockX, kBlockY);
-    const dim3 grid(div_up(n, block.x), div_up(m, block.y));
+    const dim3 block(kBlockDimX, kBlockDimY);
+    const dim3 grid(div_up(n, kBlockN), div_up(m, kBlockM));
     kernel_v2<<<grid, block>>>(a, b, c, m, n, k);
 }
 
-// ========= v3: 2x1 register tile =========
-// register tile 解决的问题：让一个线程维护多个寄存器累加器，复用一次 shared memory 读取服务多个输出。
-__global__ void kernel_v3(const float* a, const float* b, float* c, int m, int n, int k) {
-    __shared__ float tile_a[kV3TileM][kTileK];
-    __shared__ float tile_b[kTileK][kBlockX];
-
-    int ty = threadIdx.y;
-    int tx = threadIdx.x;
-    int row0 = blockIdx.y * kV3TileM + ty;
-    int row1 = row0 + kBlockY;
-    int col = blockIdx.x * blockDim.x + tx;
-
-    float sum0 = 0.0f;
-    float sum1 = 0.0f;
-    for (int tile_k = 0; tile_k < k; tile_k += kTileK) {
-        int a_col = tile_k + tx;
-        int b_row = tile_k + ty;
-
-        tile_a[ty][tx] = (row0 < m && a_col < k) ? 
-                            a[static_cast<size_t>(row0) * k + a_col] : 0.0f;
-        tile_a[ty + kBlockY][tx] = (row1 < m && a_col < k) ?
-                            a[static_cast<size_t>(row1) * k + a_col] : 0.0f;
-        tile_b[ty][tx] = (col < n && b_row < k) ?
-                            b[static_cast<size_t>(b_row) * n + col] : 0.0f;
-        __syncthreads();
-
-        for (int inner = 0; inner < kTileK; inner++) {
-            const float b_val = tile_b[inner][tx];
-            sum0 += tile_a[ty][inner] * b_val;
-            sum1 += tile_a[ty + kBlockY][inner] * b_val;
-        }
-        __syncthreads();
-    }
-
-    if (row0 < m && col < n) {
-        c[static_cast<size_t>(row0) * n + col] = sum0;
-    }
-    if (row1 < m && col < n) {
-        c[static_cast<size_t>(row1) * n + col] = sum1;
-    }
+// 估算 v2 的有效 global memory 访存字节数，用于 print_row 的 GB/s。
+// m/n/k: GEMM 的三个维度；非整除时按实际 grid tile 数估算。
+size_t bytes_tiled(int m, int n, int k) {
+    const size_t grid_m = div_up(m, kBlockM);
+    const size_t grid_n = div_up(n, kBlockN);
+    const size_t k_tiles = div_up(k, kBlockK);
+    const size_t load_bytes =
+        grid_m * grid_n * k_tiles * (kBlockM * kBlockK + kBlockK * kBlockN) * sizeof(float);
+    const size_t store_bytes = static_cast<size_t>(m) * n * sizeof(float);
+    return load_bytes + store_bytes;
 }
 
-void launch_v3(const float* a, const float* b, float* c, int m, int n, int k) {
-    const dim3 block(kBlockX, kBlockY);
-    const dim3 grid(div_up(n, block.x), div_up(m, kV3TileM));
-    kernel_v3<<<grid, block>>>(a, b, c, m, n, k);
-}
-
-// ========= v4: 2x2 register tile =========
-// 2D register tile 解决的问题：同时扩大输出 tile 的行和列，让一个线程的多个寄存器累加器复用 A 和 B 两侧数据。
-__global__ void kernel_v4(const float* a, const float* b, float* c, int m, int n, int k) {
-    __shared__ float tile_a[kV3TileM][kTileK];
-    __shared__ float tile_b[kTileK][kV4TileN];
-
-    const int ty = threadIdx.y;
-    const int tx = threadIdx.x;
-    const int row0 = blockIdx.y * kV3TileM + ty;
-    const int row1 = row0 + kBlockY;
-    const int col0 = blockIdx.x * kV4TileN + tx;
-    const int col1 = col0 + kBlockX;
-
-    float sum00 = 0.0f;
-    float sum01 = 0.0f;
-    float sum10 = 0.0f;
-    float sum11 = 0.0f;
-    for (int tile_k = 0; tile_k < k; tile_k += kTileK) {
-        const int a_col = tile_k + tx;
-        const int b_row = tile_k + ty;
-
-        tile_a[ty][tx] = (row0 < m && a_col < k) ?
-                            a[static_cast<size_t>(row0) * k + a_col] : 0.0f;
-        tile_a[ty + kBlockY][tx] = (row1 < m && a_col < k) ?
-                            a[static_cast<size_t>(row1) * k + a_col] : 0.0f;
-        tile_b[ty][tx] = (b_row < k && col0 < n) ?
-                            b[static_cast<size_t>(b_row) * n + col0] : 0.0f;
-        tile_b[ty][tx + kBlockX] = (b_row < k && col1 < n) ?
-                            b[static_cast<size_t>(b_row) * n + col1] : 0.0f;
-        __syncthreads();
-
-        for (int inner = 0; inner < kTileK; inner++) {
-            const float a0 = tile_a[ty][inner];
-            const float a1 = tile_a[ty + kBlockY][inner];
-            const float b0 = tile_b[inner][tx];
-            const float b1 = tile_b[inner][tx + kBlockX];
-            sum00 += a0 * b0;
-            sum01 += a0 * b1;
-            sum10 += a1 * b0;
-            sum11 += a1 * b1;
-        }
-        __syncthreads();
-    }
-
-    if (row0 < m && col0 < n) {
-        c[static_cast<size_t>(row0) * n + col0] = sum00;
-    }
-    if (row0 < m && col1 < n) {
-        c[static_cast<size_t>(row0) * n + col1] = sum01;
-    }
-    if (row1 < m && col0 < n) {
-        c[static_cast<size_t>(row1) * n + col0] = sum10;
-    }
-    if (row1 < m && col1 < n) {
-        c[static_cast<size_t>(row1) * n + col1] = sum11;
-    }
-}
-
-void launch_v4(const float* a, const float* b, float* c, int m, int n, int k) {
-    const dim3 block(kBlockX, kBlockY);
-    const dim3 grid(div_up(n, kV4TileN), div_up(m, kV3TileM));
-    kernel_v4<<<grid, block>>>(a, b, c, m, n, k);
-}
-
-// ========= v5: final 4x4 register tile =========
-// 收官版复用旧技巧：继续扩大 2D register tile，换取更高 A/B 数据复用；代价是更高 register pressure。
-__global__ void kernel_v5(const float* a, const float* b, float* c, int m, int n, int k) {
-    __shared__ float tile_a[kV5TileM][kTileK];
-    __shared__ float tile_b[kTileK][kV5TileN];
-
-    const int ty = threadIdx.y;
-    const int tx = threadIdx.x;
-    const int row_base = blockIdx.y * kV5TileM + ty;
-    const int col_base = blockIdx.x * kV5TileN + tx;
-
-    float sum[kV5RowsPerThread][kV5ColsPerThread] = {};
-    for (int tile_k = 0; tile_k < k; tile_k += kTileK) {
-        const int a_col = tile_k + tx;
-        const int b_row = tile_k + ty;
-
-        #pragma unroll
-        for (int i = 0; i < kV5RowsPerThread; i++) {
-            const int row = row_base + i * kBlockY;
-            tile_a[ty + i * kBlockY][tx] = (row < m && a_col < k) ?
-                a[static_cast<size_t>(row) * k + a_col] : 0.0f;
-        }
-
-        #pragma unroll
-        for (int j = 0; j < kV5ColsPerThread; j++) {
-            const int col = col_base + j * kBlockX;
-            tile_b[ty][tx + j * kBlockX] = (b_row < k && col < n) ?
-                b[static_cast<size_t>(b_row) * n + col] : 0.0f;
-        }
-        __syncthreads();
-
-        #pragma unroll
-        for (int inner = 0; inner < kTileK; inner++) {
-            float a_vals[kV5RowsPerThread];
-            float b_vals[kV5ColsPerThread];
-
-            #pragma unroll
-            for (int i = 0; i < kV5RowsPerThread; i++) {
-                a_vals[i] = tile_a[ty + i * kBlockY][inner];
-            }
-            #pragma unroll
-            for (int j = 0; j < kV5ColsPerThread; j++) {
-                b_vals[j] = tile_b[inner][tx + j * kBlockX];
-            }
-            #pragma unroll
-            for (int i = 0; i < kV5RowsPerThread; i++) {
-                #pragma unroll
-                for (int j = 0; j < kV5ColsPerThread; j++) {
-                    sum[i][j] += a_vals[i] * b_vals[j];
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    #pragma unroll
-    for (int i = 0; i < kV5RowsPerThread; i++) {
-        const int row = row_base + i * kBlockY;
-        if (row < m) {
-            #pragma unroll
-            for (int j = 0; j < kV5ColsPerThread; j++) {
-                const int col = col_base + j * kBlockX;
-                if (col < n) {
-                    c[static_cast<size_t>(row) * n + col] = sum[i][j];
-                }
-            }
-        }
-    }
-}
-
-void launch_v5(const float* a, const float* b, float* c, int m, int n, int k) {
-    const dim3 block(kBlockX, kBlockY);
-    const dim3 grid(div_up(n, kV5TileN), div_up(m, kV5TileM));
-    kernel_v5<<<grid, block>>>(a, b, c, m, n, k);
-}
-
-// ========= cuBLAS baseline: FP32 SGEMM =========
-// cuBLAS 基线解决的问题：给手写 CUDA kernel 提供一个同机同规模的库函数性能上界参考。
-void launch_cublas(const float* a, const float* b, float* c, int m, int n, int k) {
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-
-    // cuBLAS uses column-major matrices. Row-major C = A * B is equivalent to
-    // column-major C^T = B^T * A^T using the same memory buffers.
-    CUBLAS_CHECK(cublasSgemm(g_cublas_handle,
-                             CUBLAS_OP_N,
-                             CUBLAS_OP_N,
-                             n,
-                             m,
-                             k,
-                             &alpha,
-                             b,
-                             n,
-                             a,
-                             k,
-                             &beta,
-                             c,
-                             n));
+// GEMM 有效 FLOPs：每个 C 元素做 k 次乘法和 k 次加法，计 2*k FLOPs。
+// m/n/k: GEMM 的三个维度。
+size_t flops_gemm(int m, int n, int k) {
+    return static_cast<size_t>(m) * n * 2ULL * static_cast<size_t>(k);
 }
 
 }  // namespace
 
-int main() {
-    const int m = kM;
-    const int n = kN;
-    const int k = kK;
+// 命令行入口。
+// argc/argv: 不传参数时使用默认 1024x1024x1024；传 3 个参数时按 [M N K] 运行。
+int main(int argc, char** argv) {
+    print_device_info();
+
+    int m = kM;
+    int n = kN;
+    int k = kK;
+    if (argc == 4) {
+        m = std::atoi(argv[1]);
+        n = std::atoi(argv[2]);
+        k = std::atoi(argv[3]);
+    } else if (argc != 1) {
+        std::fprintf(stderr, "usage: %s [M N K]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    if (m <= 0 || n <= 0 || k <= 0) {
+        std::fprintf(stderr, "M, N and K must be positive\n");
+        return EXIT_FAILURE;
+    }
 
     const size_t elems_a = static_cast<size_t>(m) * k;
     const size_t elems_b = static_cast<size_t>(k) * n;
     const size_t elems_c = static_cast<size_t>(m) * n;
-    const size_t bytes_a = elems_a * sizeof(float);
-    const size_t bytes_b = elems_b * sizeof(float);
-    const size_t bytes_c = elems_c * sizeof(float);
 
-    const size_t traffic_bytes_naive = elems_c * static_cast<size_t>(2 * k + 1) * sizeof(float);
-    const size_t traffic_bytes_v2 =
-        (elems_a * static_cast<size_t>(div_up(n, kBlockX)) +
-         elems_b * static_cast<size_t>(div_up(m, kBlockY)) +
-         elems_c) * sizeof(float);
-    const size_t traffic_bytes_v3 =
-        (elems_a * static_cast<size_t>(div_up(n, kBlockX)) +
-         elems_b * static_cast<size_t>(div_up(m, kV3TileM)) +
-         elems_c) * sizeof(float);
-    const size_t traffic_bytes_v4 =
-        (elems_a * static_cast<size_t>(div_up(n, kV4TileN)) +
-         elems_b * static_cast<size_t>(div_up(m, kV3TileM)) +
-         elems_c) * sizeof(float);
-    const size_t traffic_bytes_v5 =
-        (elems_a * static_cast<size_t>(div_up(n, kV5TileN)) +
-         elems_b * static_cast<size_t>(div_up(m, kV5TileM)) +
-         elems_c) * sizeof(float);
-    const size_t traffic_bytes_cublas = bytes_a + bytes_b + bytes_c;
-    const size_t flops_naive = elems_c * static_cast<size_t>(2 * k);
+    float* d_a = nullptr;
+    float* d_b = nullptr;
+    float* d_c = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_a, elems_a * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_b, elems_b * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_c, elems_c * sizeof(float)));
 
-    float *d_a = nullptr, *d_b = nullptr, *d_c = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_a, bytes_a));
-    CUDA_CHECK(cudaMalloc(&d_b, bytes_b));
-    CUDA_CHECK(cudaMalloc(&d_c, bytes_c));
+    random_fill(d_a, elems_a, 2026, -0.5f, 0.5f);
+    random_fill(d_b, elems_b, 2027, -0.5f, 0.5f);
 
-    nvtxRangePushA("random_fill");
-    random_fill(d_a, elems_a, 2031);
-    random_fill(d_b, elems_b, 2032);
-    nvtxRangePop();
-
-    std::vector<float> h_a(elems_a), h_b(elems_b), h_ref(elems_c), h_out(elems_c);
-    
-    nvtxRangePushA("copy_input_to_host");
-    CUDA_CHECK(cudaMemcpy(h_a.data(), d_a, bytes_a, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_b.data(), d_b, bytes_b, cudaMemcpyDeviceToHost));
-    nvtxRangePop();
-
-    nvtxRangePushA("cpu_ref");
+    std::vector<float> h_a(elems_a);
+    std::vector<float> h_b(elems_b);
+    std::vector<float> h_ref(elems_c);
+    std::vector<float> h_got(elems_c);
+    CUDA_CHECK(cudaMemcpy(h_a.data(), d_a, elems_a * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_b.data(), d_b, elems_b * sizeof(float), cudaMemcpyDeviceToHost));
     cpu_ref(h_a, h_b, h_ref, m, n, k);
-    nvtxRangePop();
 
-    CUBLAS_CHECK(cublasCreate(&g_cublas_handle));
-    CUBLAS_CHECK(cublasSetMathMode(g_cublas_handle, CUBLAS_PEDANTIC_MATH));
+    CUDA_CHECK(cudaMemset(d_c, 0, elems_c * sizeof(float)));
+    launch_v2(d_a, d_b, d_c, m, n, k);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(h_got.data(), d_c, elems_c * sizeof(float), cudaMemcpyDeviceToHost));
+    float err = 0.0f;
+    const bool ok = check_close(h_got.data(), h_ref.data(), elems_c, 1e-3f, 1e-5f, &err);
 
     print_header();
-
-    struct Version {
-        const char* name;
-        void (*launch)(const float*, const float*, float*, int, int, int);
-        size_t traffic_bytes;
-        size_t flops;
-    };
-
-    const std::array<Version, 6> versions{{
-        {"naive", launch_naive, traffic_bytes_naive, flops_naive},
-        {"v2_smem", launch_v2, traffic_bytes_v2, flops_naive},
-        {"v3_reg_tile", launch_v3, traffic_bytes_v3, flops_naive},
-        {"v4_2d_reg_tile", launch_v4, traffic_bytes_v4, flops_naive},
-        {"v5_final_4x4", launch_v5, traffic_bytes_v5, flops_naive},
-        {"cublas_sgemm", launch_cublas, traffic_bytes_cublas, flops_naive},
-    }};
-
-    for (const auto& version : versions) {
-        version.launch(d_a, d_b, d_c, m, n, k);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        CUDA_CHECK(cudaMemcpy(h_out.data(), d_c, bytes_c, cudaMemcpyDeviceToHost));
-        float err = 0.0f;
-        if (!check_close(h_out.data(), h_ref.data(), h_out.size(), 1e-4f, 1e-5f, &err)) {
-            std::cerr << "correctness failed: max_err=" << err << '\n';
-            CUBLAS_CHECK(cublasDestroy(g_cublas_handle));
-            CUDA_CHECK(cudaFree(d_a));
-            CUDA_CHECK(cudaFree(d_b));
-            CUDA_CHECK(cudaFree(d_c));
-            return 1;
-        }
-
-        const float ms = timeit([&] { version.launch(d_a, d_b, d_c, m, n, k); });
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-        print_row(version.name, ms, version.traffic_bytes, version.flops, err);
+    if (ok) {
+        const float ms = timeit([&]() { launch_v2(d_a, d_b, d_c, m, n, k); });
+        print_row("v2_float4_pad", ms, bytes_tiled(m, n, k), flops_gemm(m, n, k), err);
     }
 
-    CUBLAS_CHECK(cublasDestroy(g_cublas_handle));
     CUDA_CHECK(cudaFree(d_a));
     CUDA_CHECK(cudaFree(d_b));
     CUDA_CHECK(cudaFree(d_c));
-    return 0;
+    return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
